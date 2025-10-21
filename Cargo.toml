@@ -1,0 +1,27 @@
+[package]
+name = "otters"
+version = "0.1.0"
+edition = "2024"
+authors = ["CryptoPatrick <cryptopatrick@gmail.com>"]
+
+###############################################################################
+description = "First-Order Logic Theorem Prover"
+documentation = "https://docs.rs/otters"
+homepage = "https://github.com/cryptopatrick/otters"
+repository = "https://github.com/cryptopatrick/otters"
+readme = "README.md"
+keywords = ["<KEYWORD1>", "<KEYWORD2>" ]
+license = "MIT"
+autotests = false
+
+###############################################################################
+[lib]
+name = "otters"
+path = "src/lib.rs"
+
+[[test]]
+name = "tests"
+path = "tests/test.rs"
+
+###############################################################################
+[dependencies]
