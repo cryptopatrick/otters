@@ -19,9 +19,21 @@ autotests = false
 name = "otters"
 path = "src/lib.rs"
 
+[[bin]]
+name = "otter"
+path = "src/main.rs"
+
+[[bin]]
+name = "regression"
+path = "src/bin/regression.rs"
+
 [[test]]
 name = "tests"
 path = "tests/test.rs"
+
+[[test]]
+name = "smoke_tests"
+path = "tests/smoke_tests.rs"
 
 ###############################################################################
 [dependencies]
