@@ -179,7 +179,10 @@ impl Prover {
     }
 
     /// Add a clause to the set of support.
-    pub fn add_sos(&mut self, clause: Clause) -> ClauseId {
+    pub fn add_sos(&mut self, mut clause: Clause) -> ClauseId {
+        // Cache the weight for efficient clause selection
+        clause.pick_weight = self.weight_table.weight_clause(&clause);
+
         let id = self.arena.insert(clause);
         self.sos.push(id);
         self.clauses_kept += 1;
@@ -187,7 +190,10 @@ impl Prover {
     }
 
     /// Add a clause to the usable set.
-    pub fn add_usable(&mut self, clause: Clause) -> ClauseId {
+    pub fn add_usable(&mut self, mut clause: Clause) -> ClauseId {
+        // Cache the weight (may be used if clause moves to SOS later)
+        clause.pick_weight = self.weight_table.weight_clause(&clause);
+
         let id = self.arena.insert(clause);
         self.usable.push(id);
         self.clauses_kept += 1;
@@ -198,6 +204,8 @@ impl Prover {
     ///
     /// This scans all clauses in SOS, finds the one with minimum weight,
     /// removes it from the list, and returns it.
+    ///
+    /// Note: Uses cached pick_weight from clause for O(n) selection instead of O(n*m).
     fn select_lightest_clause(&mut self) -> Option<ClauseId> {
         if self.sos.is_empty() {
             return None;
@@ -209,9 +217,10 @@ impl Prover {
 
         for (index, clause_id) in self.sos.iter().enumerate() {
             if let Some(clause) = self.arena.get(*clause_id) {
-                let weight = self.weight_table.weight_clause(clause);
-                if weight < min_weight {
-                    min_weight = weight;
+                // Use cached weight instead of recalculating!
+                // This changes complexity from O(n*m) to O(n) where m = avg clause size
+                if clause.pick_weight < min_weight {
+                    min_weight = clause.pick_weight;
                     min_index = index;
                 }
             }

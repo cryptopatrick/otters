@@ -37,6 +37,7 @@ impl ListSection {
         &self,
         arena: &mut ClauseArena,
         symbols: &SymbolTable,
+        operators: &crate::parser::OperatorTable,
     ) -> Result<ClauseList, ParseError> {
         if !matches!(self.kind, ListKind::Clause) {
             return Err(ParseError::new(
@@ -51,7 +52,7 @@ impl ListSection {
 
         let mut list = ClauseList::new(&self.name);
         for entry in &self.raw_entries {
-            let mut clause = parse_clause(entry, symbols)?;
+            let mut clause = parse_clause(entry, symbols, operators)?;
             clause.add_attribute(ClauseAttribute::new(
                 "list",
                 ClauseAttributeValue::Text(self.name.clone()),
@@ -401,6 +402,7 @@ impl Parser {
 fn parse_clause(
     entry: &str,
     symbols: &SymbolTable,
+    operators: &crate::parser::OperatorTable,
 ) -> Result<Clause, ParseError> {
     let entry = entry.trim();
     if entry.is_empty() {
@@ -413,7 +415,7 @@ fn parse_clause(
 
     for literal_text in split_literals(&core) {
         let (literal, mut literal_attrs) =
-            parse_literal(literal_text, symbols)?;
+            parse_literal(literal_text, symbols, operators)?;
         literals.push(literal);
         attributes.append(&mut literal_attrs);
     }
@@ -430,12 +432,15 @@ pub(crate) fn parse_literal_internal(
     text: &str,
     symbols: &SymbolTable,
 ) -> Result<(Literal, Vec<ClauseAttribute>), ParseError> {
-    parse_literal(text, symbols)
+    // Formula parser doesn't have operators yet, so use default table
+    let operators = crate::parser::OperatorTable::new();
+    parse_literal(text, symbols, &operators)
 }
 
 fn parse_literal(
     text: &str,
     symbols: &SymbolTable,
+    operators: &crate::parser::OperatorTable,
 ) -> Result<(Literal, Vec<ClauseAttribute>), ParseError> {
     let mut trimmed = text.trim();
     let mut attributes = Vec::new();
@@ -455,8 +460,8 @@ fn parse_literal(
         let (lhs, rhs) = trimmed.split_at(idx);
         let rhs = &rhs[2..];
         let eq_symbol = intern_equality(symbols);
-        let left_term = parse_term(lhs, symbols)?;
-        let right_term = parse_term(rhs, symbols)?;
+        let left_term = parse_term(lhs, symbols, operators)?;
+        let right_term = parse_term(rhs, symbols, operators)?;
         let term = Term::application(eq_symbol, vec![left_term, right_term]);
         return Ok((Literal::new(false, term), attributes));
     }
@@ -465,8 +470,8 @@ fn parse_literal(
         let (lhs, rhs) = trimmed.split_at(idx);
         let rhs = &rhs[1..];
         let eq_symbol = intern_equality(symbols);
-        let left_term = parse_term(lhs, symbols)?;
-        let right_term = parse_term(rhs, symbols)?;
+        let left_term = parse_term(lhs, symbols, operators)?;
+        let right_term = parse_term(rhs, symbols, operators)?;
         let term = Term::application(eq_symbol, vec![left_term, right_term]);
         return Ok((Literal::new(sign, term), attributes));
     }
@@ -478,7 +483,7 @@ fn parse_literal(
         let args_text = &trimmed[open_paren + 1..close_paren];
         let args = split_arguments(args_text)
             .into_iter()
-            .map(|arg| parse_term(arg, symbols))
+            .map(|arg| parse_term(arg, symbols, operators))
             .collect::<Result<Vec<_>, _>>()?;
         let symbol_id = symbols.intern(
             name.trim(),
@@ -494,7 +499,11 @@ fn parse_literal(
     }
 }
 
-fn parse_term(text: &str, symbols: &SymbolTable) -> Result<Term, ParseError> {
+fn parse_term(
+    text: &str,
+    symbols: &SymbolTable,
+    operators: &crate::parser::OperatorTable,
+) -> Result<Term, ParseError> {
     let text = text.trim();
     if text.is_empty() {
         return Err(ParseError::new(0, 0, "empty term"));
@@ -518,7 +527,7 @@ fn parse_term(text: &str, symbols: &SymbolTable) -> Result<Term, ParseError> {
         let args_text = &text[open_paren + 1..close_paren];
         let args = split_arguments(args_text)
             .into_iter()
-            .map(|arg| parse_term(arg, symbols))
+            .map(|arg| parse_term(arg, symbols, operators))
             .collect::<Result<Vec<_>, _>>()?;
         let symbol_id = symbols.intern(
             name.trim(),
@@ -528,11 +537,10 @@ fn parse_term(text: &str, symbols: &SymbolTable) -> Result<Term, ParseError> {
         return Ok(Term::application(symbol_id, args));
     }
 
-    // Check for infix operators (+, *, etc.)
-    // We need to find the operator at the top level (not inside parentheses)
-    if let Some((left, op, right)) = find_infix_operator(text) {
-        let left_term = parse_term(left, symbols)?;
-        let right_term = parse_term(right, symbols)?;
+    // Check for infix operators using the operator table
+    if let Some((left, op, right)) = find_infix_operator(text, operators) {
+        let left_term = parse_term(left, symbols, operators)?;
+        let right_term = parse_term(right, symbols, operators)?;
         let symbol_id = symbols.intern(op, 2, SymbolKind::Function);
         return Ok(Term::application(symbol_id, vec![left_term, right_term]));
     }
@@ -547,17 +555,35 @@ fn parse_term(text: &str, symbols: &SymbolTable) -> Result<Term, ParseError> {
 
 /// Find an infix operator at the top level of a term.
 /// Returns (left_operand, operator, right_operand) if found.
-/// Handles operator precedence: + and - are lower precedence than * and /
-fn find_infix_operator(text: &str) -> Option<(&str, &str, &str)> {
-    // Operators in order of increasing precedence (we scan for lowest precedence first)
-    let operators = ["+", "-", "*", "/"];
+/// Uses the operator table to determine which operators to search for
+/// and respects their precedence and associativity.
+fn find_infix_operator<'a>(
+    text: &'a str,
+    operators: &crate::parser::OperatorTable,
+) -> Option<(&'a str, &'a str, &'a str)> {
+    // Get all infix operators sorted by precedence (lowest first)
+    let infix_ops = operators.infix_operators();
+    if infix_ops.is_empty() {
+        return None;
+    }
 
-    let mut depth = 0;
     let text_bytes = text.as_bytes();
 
-    // Scan from right to left to get left-associativity for equal-precedence operators
-    for op in &operators {
-        for i in (0..text.len()).rev() {
+    // Scan for operators by precedence (lowest precedence first)
+    // This ensures we split at the lowest-precedence operator
+    for op_info in infix_ops {
+        let op_str = &op_info.symbol;
+        let mut depth = 0;
+
+        // For left-associative operators, scan right-to-left
+        // For right-associative operators, scan left-to-right
+        let scan_indices: Vec<usize> = if op_info.fixity.is_left_assoc() {
+            (0..text.len()).rev().collect()
+        } else {
+            (0..text.len()).collect()
+        };
+
+        for i in scan_indices {
             let ch = text_bytes[i] as char;
 
             // Track parenthesis depth
@@ -568,12 +594,14 @@ fn find_infix_operator(text: &str) -> Option<(&str, &str, &str)> {
             }
 
             // Only consider operators at depth 0 (not inside parentheses)
-            if depth == 0 && text[i..].starts_with(op) {
+            if depth == 0 && text[i..].starts_with(op_str) {
                 let left = &text[..i];
-                let right = &text[i + op.len()..];
+                let right = &text[i + op_str.len()..];
 
                 // Make sure we're not at the start (unary operator case)
                 if !left.is_empty() && !right.is_empty() {
+                    // Return the operator substring from text (not from op_info)
+                    let op = &text[i..i + op_str.len()];
                     return Some((left.trim(), op, right.trim()));
                 }
             }
@@ -950,8 +978,9 @@ mod tests {
         assert_eq!(section.kind, ListKind::Clause);
         let mut arena = ClauseArena::new();
         let symbols = SymbolTable::new();
+        let operators = crate::parser::OperatorTable::new();
         let list =
-            section.to_clause_list(&mut arena, &symbols).expect("clause list");
+            section.to_clause_list(&mut arena, &symbols, &operators).expect("clause list");
         assert_eq!(list.len(), 2);
     }
 
@@ -999,8 +1028,9 @@ mod tests {
         let section = &file.lists[0];
         let mut arena = ClauseArena::new();
         let symbols = SymbolTable::new();
+        let operators = crate::parser::OperatorTable::new();
         let list =
-            section.to_clause_list(&mut arena, &symbols).expect("clause list");
+            section.to_clause_list(&mut arena, &symbols, &operators).expect("clause list");
         assert_eq!(list.len(), 1);
     }
 
@@ -1012,7 +1042,8 @@ mod tests {
         let section = &file.lists[0];
         let mut arena = ClauseArena::new();
         let symbols = SymbolTable::new();
-        section.to_clause_list(&mut arena, &symbols).expect("clause list");
+        let operators = crate::parser::OperatorTable::new();
+        section.to_clause_list(&mut arena, &symbols, &operators).expect("clause list");
         let clause = arena.iter().next().expect("clause present");
         assert_eq!(clause.literals.len(), 2);
         assert!(clause.literals[0].sign);
@@ -1028,7 +1059,8 @@ mod tests {
         let section = &file.lists[0];
         let mut arena = ClauseArena::new();
         let symbols = SymbolTable::new();
-        section.to_clause_list(&mut arena, &symbols).expect("clause list");
+        let operators = crate::parser::OperatorTable::new();
+        section.to_clause_list(&mut arena, &symbols, &operators).expect("clause list");
         let mut iter = arena.iter();
         let clause1 = iter.next().expect("first clause");
         assert!(clause1.literals[0].sign);
@@ -1044,7 +1076,8 @@ mod tests {
         let section = &file.lists[0];
         let mut arena = ClauseArena::new();
         let symbols = SymbolTable::new();
-        section.to_clause_list(&mut arena, &symbols).expect("clause list");
+        let operators = crate::parser::OperatorTable::new();
+        section.to_clause_list(&mut arena, &symbols, &operators).expect("clause list");
         let clause = arena.iter().next().expect("clause present");
         let has_label =
             clause.attributes.iter().any(|attr| attr.name == "label");

@@ -136,7 +136,7 @@ impl ProverBuilder {
                                 .map_err(|e| e.to_string())?
                         }
                         _ => {
-                            list.to_clause_list(&mut arena, &self.symbols)
+                            list.to_clause_list(&mut arena, &self.symbols, &file.operators)
                                 .map_err(|e| e.to_string())?
                         }
                     };
@@ -154,7 +154,7 @@ impl ProverBuilder {
                                 .map_err(|e| e.to_string())?
                         }
                         _ => {
-                            list.to_clause_list(&mut arena, &self.symbols)
+                            list.to_clause_list(&mut arena, &self.symbols, &file.operators)
                                 .map_err(|e| e.to_string())?
                         }
                     };
