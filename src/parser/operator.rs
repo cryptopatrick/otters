@@ -18,6 +18,10 @@ pub enum Fixity {
     InfixRightAssoc,
     /// Infix operator, left-associative (yfx)
     InfixLeftAssoc,
+    /// Postfix operator, non-associative (xf)
+    Postfix,
+    /// Postfix operator, left-associative (yf)
+    PostfixLeftAssoc,
 }
 
 impl Fixity {
@@ -29,6 +33,8 @@ impl Fixity {
             "xfx" => Some(Fixity::Infix),
             "xfy" => Some(Fixity::InfixRightAssoc),
             "yfx" => Some(Fixity::InfixLeftAssoc),
+            "xf" => Some(Fixity::Postfix),
+            "yf" => Some(Fixity::PostfixLeftAssoc),
             _ => None,
         }
     }
@@ -46,6 +52,11 @@ impl Fixity {
         )
     }
 
+    /// Check if this is a postfix operator
+    pub fn is_postfix(&self) -> bool {
+        matches!(self, Fixity::Postfix | Fixity::PostfixLeftAssoc)
+    }
+
     /// Check if this is right-associative
     pub fn is_right_assoc(&self) -> bool {
         matches!(self, Fixity::PrefixRightAssoc | Fixity::InfixRightAssoc)
@@ -53,7 +64,7 @@ impl Fixity {
 
     /// Check if this is left-associative
     pub fn is_left_assoc(&self) -> bool {
-        matches!(self, Fixity::InfixLeftAssoc)
+        matches!(self, Fixity::InfixLeftAssoc | Fixity::PostfixLeftAssoc)
     }
 }
 
@@ -123,6 +134,14 @@ impl OperatorTable {
         self.operators
             .values()
             .filter(|op| op.fixity.is_prefix())
+            .collect()
+    }
+
+    /// Get all postfix operators
+    pub fn postfix_operators(&self) -> Vec<&Operator> {
+        self.operators
+            .values()
+            .filter(|op| op.fixity.is_postfix())
             .collect()
     }
 

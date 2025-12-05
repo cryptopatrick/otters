@@ -53,6 +53,21 @@ fn main() {
         }
     }
 
+    // Print all parse failures
+    if summary.parse_failures > 0 {
+        println!("\n=== PARSE FAILURES ({}) ===", summary.parse_failures);
+        let mut count = 0;
+        for result in &summary.results {
+            if let Some(err) = &result.error {
+                count += 1;
+                if let Some(name) = result.case.name() {
+                    println!("\n{}. {:?}", count, name);
+                    println!("   Error: {}", err);
+                }
+            }
+        }
+    }
+
     println!("\n=== Complete ===");
 
     // Exit with error code if there were failures

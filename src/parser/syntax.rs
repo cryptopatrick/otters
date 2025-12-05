@@ -159,6 +159,8 @@ pub enum OtterCommand {
     Clear(String),
     Assign { name: String, value: String },
     Op { precedence: u16, fixity: String, symbol: String },
+    Lex { symbols: Vec<String> },
+    MakeEvaluable { operator: String, evaluator: String },
     ProofObject(String),
     Generic(String),
 }
@@ -456,6 +458,24 @@ fn parse_literal(
         trimmed = trimmed.trim_start_matches(|c| c == '-' || c == '~').trim();
     }
 
+    // Check if the entire literal is wrapped in parentheses
+    // e.g., "(x = y)" should be parsed as "x = y"
+    if trimmed.starts_with('(') && trimmed.ends_with(')') {
+        if let Some(close_idx) = matching_paren_index(trimmed, 0) {
+            if close_idx == trimmed.len() - 1 {
+                // The parentheses wrap the entire literal, so strip them
+                let inner = &trimmed[1..trimmed.len() - 1];
+                let (inner_lit, inner_attrs) = parse_literal(inner, symbols, operators)?;
+                // Combine sign: if outer is negative and inner is negative, result is positive
+                let combined_sign = if sign { inner_lit.sign } else { !inner_lit.sign };
+                let mut combined_attrs = attributes;
+                combined_attrs.extend(inner_attrs);
+                return Ok((Literal::new(combined_sign, inner_lit.atom.clone()), combined_attrs));
+            }
+        }
+    }
+
+    // Check for != first (special case for disequality)
     if let Some(idx) = trimmed.find("!=") {
         let (lhs, rhs) = trimmed.split_at(idx);
         let rhs = &rhs[2..];
@@ -466,7 +486,9 @@ fn parse_literal(
         return Ok((Literal::new(false, term), attributes));
     }
 
-    if let Some(idx) = find_top_level_char(trimmed, '=') {
+    // Check for = (equality), but only if it's not part of <= or >=
+    // We need to find '=' that's not preceded by '<' or '>' at the same position
+    if let Some(idx) = find_equality_position(trimmed) {
         let (lhs, rhs) = trimmed.split_at(idx);
         let rhs = &rhs[1..];
         let eq_symbol = intern_equality(symbols);
@@ -520,6 +542,19 @@ fn parse_term(
         return Ok(Term::variable(VariableId::new((first_char - b'A') as u16)));
     }
 
+    // Check for Prolog-style lists: [], [a,b,c], [H|T]
+    if text.starts_with('[') && text.ends_with(']') {
+        return parse_list(text, symbols, operators);
+    }
+
+    // Check for prefix operators (e.g., ~x, ~(A | B))
+    // Must be checked before function application to handle prefix ops correctly
+    if let Some((op, operand)) = find_prefix_operator(text, operators) {
+        let operand_term = parse_term(operand, symbols, operators)?;
+        let symbol_id = symbols.intern(op, 1, SymbolKind::Function);
+        return Ok(Term::application(symbol_id, vec![operand_term]));
+    }
+
     if let Some(open_paren) = text.find('(') {
         let close_paren = matching_paren_index(text, open_paren)
             .ok_or_else(|| ParseError::new(0, 0, "unterminated term"))?;
@@ -543,6 +578,13 @@ fn parse_term(
         let right_term = parse_term(right, symbols, operators)?;
         let symbol_id = symbols.intern(op, 2, SymbolKind::Function);
         return Ok(Term::application(symbol_id, vec![left_term, right_term]));
+    }
+
+    // Check for postfix operators (e.g., x^, a!)
+    if let Some((operand, op)) = find_postfix_operator(text, operators) {
+        let operand_term = parse_term(operand, symbols, operators)?;
+        let symbol_id = symbols.intern(op, 1, SymbolKind::Function);
+        return Ok(Term::application(symbol_id, vec![operand_term]));
     }
 
     if text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
@@ -604,6 +646,112 @@ fn find_infix_operator<'a>(
                     let op = &text[i..i + op_str.len()];
                     return Some((left.trim(), op, right.trim()));
                 }
+            }
+        }
+    }
+
+    None
+}
+
+/// Parse a Prolog-style list into nested cons applications
+/// [] -> $nil
+/// [a,b,c] -> $cons(a, $cons(b, $cons(c, $nil)))
+/// [H|T] -> $cons(H, T)
+fn parse_list(
+    text: &str,
+    symbols: &SymbolTable,
+    operators: &crate::parser::OperatorTable,
+) -> Result<Term, ParseError> {
+    let inner = text[1..text.len() - 1].trim();
+
+    // Empty list: []
+    if inner.is_empty() {
+        let nil_id = symbols.intern("$nil", 0, SymbolKind::Constant);
+        return Ok(Term::application(nil_id, vec![]));
+    }
+
+    // Check for cons notation: [H|T]
+    if let Some(pipe_pos) = find_top_level_char(inner, '|') {
+        let head_str = inner[..pipe_pos].trim();
+        let tail_str = inner[pipe_pos + 1..].trim();
+
+        let head = parse_term(head_str, symbols, operators)?;
+        let tail = parse_term(tail_str, symbols, operators)?;
+
+        let cons_id = symbols.intern("$cons", 2, SymbolKind::Function);
+        return Ok(Term::application(cons_id, vec![head, tail]));
+    }
+
+    // Regular list: [a, b, c]
+    let elements = split_arguments(inner);
+    let mut result_term = {
+        let nil_id = symbols.intern("$nil", 0, SymbolKind::Constant);
+        Term::application(nil_id, vec![])
+    };
+
+    // Build the list from right to left
+    for elem_str in elements.iter().rev() {
+        let elem = parse_term(elem_str, symbols, operators)?;
+        let cons_id = symbols.intern("$cons", 2, SymbolKind::Function);
+        result_term = Term::application(cons_id, vec![elem, result_term]);
+    }
+
+    Ok(result_term)
+}
+
+/// Find a prefix operator at the start of a term.
+/// Returns (operator, operand) if found.
+/// For example, "~x" returns ("~", "x"), and "~(A | B)" returns ("~", "(A | B)")
+fn find_prefix_operator<'a>(
+    text: &'a str,
+    operators: &crate::parser::OperatorTable,
+) -> Option<(&'a str, &'a str)> {
+    // Get all prefix operators
+    let prefix_ops = operators.prefix_operators();
+    if prefix_ops.is_empty() {
+        return None;
+    }
+
+    // Try to match each prefix operator at the beginning of the text
+    for op_info in prefix_ops {
+        let op_str = &op_info.symbol;
+        if text.starts_with(op_str.as_str()) {
+            let op_len = op_str.len();
+            let operand = text[op_len..].trim();
+            if !operand.is_empty() {
+                // Return substring from original text with proper lifetime
+                let op_from_text = &text[..op_len];
+                return Some((op_from_text, operand));
+            }
+        }
+    }
+
+    None
+}
+
+/// Find a postfix operator at the end of a term.
+/// Returns (operand, operator) if found.
+/// For example, "x^" returns ("x", "^"), and "(a + b)!" returns ("(a + b)", "!")
+fn find_postfix_operator<'a>(
+    text: &'a str,
+    operators: &crate::parser::OperatorTable,
+) -> Option<(&'a str, &'a str)> {
+    // Get all postfix operators
+    let postfix_ops = operators.postfix_operators();
+    if postfix_ops.is_empty() {
+        return None;
+    }
+
+    // Try to match each postfix operator at the end of the text
+    for op_info in postfix_ops {
+        let op_str = &op_info.symbol;
+        if text.ends_with(op_str.as_str()) {
+            let op_len = op_str.len();
+            let operand = text[..text.len() - op_len].trim();
+            if !operand.is_empty() {
+                // Return substring from original text with proper lifetime
+                let op_from_text = &text[text.len() - op_len..];
+                return Some((operand, op_from_text));
             }
         }
     }
@@ -684,7 +832,50 @@ fn process_command(file: &mut OtterFile, command: OtterCommand) {
             file.operators.add_operator(symbol, precedence, fixity_enum);
         }
     }
+
+    // If it's a make_evaluable() command, extract and register the operator
+    // e.g., make_evaluable(_<=_, $LE(_,_)) -> register "<=" as an infix operator
+    if let OtterCommand::MakeEvaluable { ref operator, .. } = command {
+        // Extract the operator symbol from _op_ format
+        // Common patterns: _<=_, _+_, _>_, etc.
+        if operator.starts_with('_') && operator.ends_with('_') && operator.len() > 2 {
+            let op_symbol = &operator[1..operator.len() - 1];
+            // Register as infix operator with default precedence
+            // Common comparison/arithmetic operators
+            let precedence = match op_symbol {
+                "=" | "!=" | "<" | ">" | "<=" | ">=" => 700,
+                "+" | "-" => 500,
+                "*" | "/" | "%" => 400,
+                _ => 600, // default precedence
+            };
+            file.operators.add_operator(op_symbol, precedence, crate::parser::Fixity::Infix);
+        }
+    }
+
     file.commands.push(command);
+}
+
+/// Find the position of '=' for equality checking, but skip it if it's part of <= or >=
+/// Returns the index of a standalone '=' character at the top level (not in parens)
+fn find_equality_position(text: &str) -> Option<usize> {
+    let mut depth = 0;
+    let bytes = text.as_bytes();
+
+    for i in 0..text.len() {
+        match bytes[i] as char {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            '=' if depth == 0 => {
+                // Check if this is part of !=, <=, or >=
+                let preceded_by_special = i > 0 && matches!(bytes[i - 1] as char, '!' | '<' | '>');
+                if !preceded_by_special {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_command(text: &str) -> OtterCommand {
@@ -724,6 +915,31 @@ fn parse_command(text: &str) -> OtterCommand {
             }
         }
     }
+    if lower.starts_with("lex(") && text.ends_with(')') {
+        // Parse lex([sym1, sym2, ...])
+        let inner = &text[4..text.len() - 1].trim();
+        if inner.starts_with('[') && inner.ends_with(']') {
+            let list_content = &inner[1..inner.len() - 1];
+            let symbols: Vec<String> = split_arguments(list_content)
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            return OtterCommand::Lex { symbols };
+        }
+    }
+    if lower.starts_with("make_evaluable(") && text.ends_with(')') {
+        // Parse make_evaluable(_+_, $SUM(_,_))
+        let inner = &text[15..text.len() - 1];
+        if let Some(comma) = find_top_level_char(inner, ',') {
+            let operator = inner[..comma].trim().to_string();
+            let evaluator = inner[comma + 1..].trim().to_string();
+            return OtterCommand::MakeEvaluable {
+                operator,
+                evaluator,
+            };
+        }
+    }
     OtterCommand::Generic(text.to_string())
 }
 
@@ -739,6 +955,13 @@ fn parse_list_header(line: &str) -> Option<ListBuilder> {
     }
     let keyword = without_dot[..open_paren].trim().to_ascii_lowercase();
     let name = without_dot[open_paren + 1..close_paren].trim().to_string();
+
+    // Validate that name is a simple identifier (not a complex expression like [])
+    // List section names should be alphanumeric identifiers, not Prolog list syntax
+    if name.is_empty() || name.contains(|c: char| !c.is_alphanumeric() && c != '_') {
+        return None;
+    }
+
     let kind = match keyword.as_str() {
         "list" => ListKind::Clause,
         "formula_list" => ListKind::Formula,
