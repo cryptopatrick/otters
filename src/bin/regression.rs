@@ -21,12 +21,19 @@ fn main() {
 
     println!("\n=== RESULTS ===");
     println!("Total examples: {}", summary.total());
-    println!("Successes: {}", summary.successes);
-    println!("Failures: {}", summary.failures);
+    println!("\n--- Proof Finding (Lenient) ---");
+    println!("Proof matches: {}", summary.proof_successes);
+    println!("Proof mismatches: {}", summary.total() - summary.proof_successes);
+    println!("Proof success rate: {:.1}%",
+             (summary.proof_successes as f64 / summary.total() as f64) * 100.0);
+    println!("\n--- Exact Metrics (Strict) ---");
+    println!("Exact matches: {}", summary.exact_successes);
+    println!("Metric differences: {}", summary.failures);
+    println!("Exact match rate: {:.1}%",
+             (summary.exact_successes as f64 / summary.total() as f64) * 100.0);
+    println!("\n--- Parse Errors ---");
     println!("Parse failures: {}", summary.parse_failures);
-    println!("Time elapsed: {:.2}s", elapsed.as_secs_f64());
-    println!("\nSuccess rate: {:.1}%",
-             (summary.successes as f64 / summary.total() as f64) * 100.0);
+    println!("\nTime elapsed: {:.2}s", elapsed.as_secs_f64());
 
     if summary.failures > 0 {
         println!("\n=== FAILURES (first 20) ===");

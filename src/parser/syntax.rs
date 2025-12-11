@@ -124,8 +124,7 @@ impl ListSection {
             let formula = crate::parser::parse_formula(entry, symbols)?;
 
             // Convert to clauses via Skolemization and CNF
-            let clauses = formula.to_clauses(symbols)
-                .map_err(|e| ParseError::new(0, 0, format!("Formula conversion failed: {}", e)))?;
+            let clauses = formula.to_clauses(symbols).map_err(|e| ParseError::new(0, 0, e))?;
 
             // Add all generated clauses to the list
             for mut clause in clauses {
@@ -217,28 +216,43 @@ impl ListBuilder {
         if trimmed.is_empty() {
             return;
         }
-        if !self.buffer.is_empty() {
+
+        // Add space separator if buffer has content and doesn't end with space
+        if !self.buffer.is_empty() && !self.buffer.ends_with(' ') {
             self.buffer.push(' ');
         }
-        self.buffer.push_str(trimmed);
+
+        // Process character by character to split on periods at depth 0
         for ch in trimmed.chars() {
             match ch {
-                '(' => self.paren_depth += 1,
-                ')' => self.paren_depth -= 1,
-                '[' => self.bracket_depth += 1,
-                ']' => self.bracket_depth -= 1,
-                _ => {}
+                '(' => {
+                    self.buffer.push(ch);
+                    self.paren_depth += 1;
+                }
+                ')' => {
+                    self.buffer.push(ch);
+                    self.paren_depth -= 1;
+                }
+                '[' => {
+                    self.buffer.push(ch);
+                    self.bracket_depth += 1;
+                }
+                ']' => {
+                    self.buffer.push(ch);
+                    self.bracket_depth -= 1;
+                }
+                '.' if self.paren_depth == 0 && self.bracket_depth == 0 => {
+                    // Found a period at depth 0 - split here
+                    let entry = self.buffer.trim().to_string();
+                    if !entry.is_empty() {
+                        self.entries.push(entry);
+                    }
+                    self.buffer.clear();
+                }
+                _ => {
+                    self.buffer.push(ch);
+                }
             }
-        }
-        if self.paren_depth == 0
-            && self.bracket_depth == 0
-            && self.buffer.ends_with('.')
-        {
-            let entry = self.buffer.trim_end_matches('.').trim().to_string();
-            if !entry.is_empty() {
-                self.entries.push(entry);
-            }
-            self.buffer.clear();
         }
     }
 
@@ -515,9 +529,58 @@ fn parse_literal(
         let term = Term::application(symbol_id, args);
         Ok((Literal::new(sign, term), attributes))
     } else {
+        // Check for infix operators (==, <, <=, >, >=) used as predicates
+        if let Some((left, op, right)) = find_infix_operator(trimmed, operators) {
+            let left_term = parse_term(left, symbols, operators)?;
+            let right_term = parse_term(right, symbols, operators)?;
+            let symbol_id = symbols.intern(op, 2, SymbolKind::Predicate);
+            let term = Term::application(symbol_id, vec![left_term, right_term]);
+            return Ok((Literal::new(sign, term), attributes));
+        }
+
         let symbol_id = symbols.intern(trimmed, 0, SymbolKind::Predicate);
         let term = Term::application(symbol_id, vec![]);
         Ok((Literal::new(sign, term), attributes))
+    }
+}
+
+/// Check if a name is a variable in Otter's default mode.
+/// In Otter, variables are names starting with 'u', 'v', 'w', 'x', 'y', or 'z'.
+/// Examples: x, y, z, x1, y2, u, v, w are all variables.
+/// Constants start with other letters (a-t) or are multi-char names like "abc".
+fn is_otter_variable(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let first_char = name.chars().next().unwrap();
+    // In Otter default mode, variables start with u-z
+    first_char >= 'u' && first_char <= 'z'
+}
+
+/// Compute a unique variable ID from a variable name.
+/// Maps single-char variables directly: x=0, y=1, z=2, u=3, v=4, w=5
+/// Multi-char variables get IDs starting from 6.
+fn compute_variable_id(name: &str) -> u16 {
+    if name.len() == 1 {
+        let c = name.chars().next().unwrap();
+        // Map x,y,z,u,v,w to 0-5
+        match c {
+            'x' => 0,
+            'y' => 1,
+            'z' => 2,
+            'u' => 3,
+            'v' => 4,
+            'w' => 5,
+            _ => 0, // Shouldn't happen if is_otter_variable is true
+        }
+    } else {
+        // For multi-char variables (x1, x2, etc.), compute a hash-based ID
+        // Start from 6 to avoid conflict with single-char vars
+        let mut id: u16 = 6;
+        for (i, c) in name.chars().enumerate() {
+            id = id.wrapping_add((c as u16).wrapping_mul((i as u16).wrapping_add(1)));
+        }
+        id
     }
 }
 
@@ -536,10 +599,15 @@ fn parse_term(
         return Ok(Term::application(id, vec![]));
     }
 
-    // In Otter, variables are uppercase letters (A, B, X, Y, Z, etc.)
-    if text.chars().all(|c| c.is_ascii_uppercase()) {
-        let first_char = text.bytes().next().unwrap_or(b'A');
-        return Ok(Term::variable(VariableId::new((first_char - b'A') as u16)));
+    // In Otter (default mode), variables are names starting with u-z.
+    // E.g., x, y, z, x1, y2, u, v, w are all variables.
+    // In Prolog style (set(prolog_style_variables)), variables start with A-Z or _.
+    // Here we implement the default Otter convention.
+    if is_otter_variable(text) {
+        // Map the first character to a variable ID
+        // We use the full variable name hash for multi-character names
+        let var_id = compute_variable_id(text);
+        return Ok(Term::variable(VariableId::new(var_id)));
     }
 
     // Check for Prolog-style lists: [], [a,b,c], [H|T]
@@ -603,7 +671,8 @@ fn find_infix_operator<'a>(
     text: &'a str,
     operators: &crate::parser::OperatorTable,
 ) -> Option<(&'a str, &'a str, &'a str)> {
-    // Get all infix operators sorted by precedence (lowest first)
+    // Get all infix operators sorted by precedence (highest first), then by length (longest first)
+    // Higher precedence binds less tightly in Otter, so we check them first
     let infix_ops = operators.infix_operators();
     if infix_ops.is_empty() {
         return None;
@@ -611,9 +680,9 @@ fn find_infix_operator<'a>(
 
     let text_bytes = text.as_bytes();
 
-    // Scan for operators by precedence (lowest precedence first)
-    // This ensures we split at the lowest-precedence operator
-    for op_info in infix_ops {
+    // Scan for operators by precedence (highest precedence first = binds less tightly)
+    // This ensures we split at the lowest-binding operator
+    for op_info in &infix_ops {
         let op_str = &op_info.symbol;
         let mut depth = 0;
 
@@ -642,7 +711,23 @@ fn find_infix_operator<'a>(
 
                 // Make sure we're not at the start (unary operator case)
                 if !left.is_empty() && !right.is_empty() {
-                    // Return the operator substring from text (not from op_info)
+                    // Check if any longer operator at the same precedence could match at this position
+                    // This prevents "=" from matching when "==" is actually present
+                    let mut is_longest_match = true;
+                    for other_op in &infix_ops {
+                        if other_op.precedence == op_info.precedence
+                            && other_op.symbol.len() > op_str.len()
+                            && text[i..].starts_with(&other_op.symbol) {
+                            is_longest_match = false;
+                            break;
+                        }
+                    }
+
+                    if !is_longest_match {
+                        continue; // Skip this match, a longer operator will match
+                    }
+
+                    // This is the longest operator at this position and precedence
                     let op = &text[i..i + op_str.len()];
                     return Some((left.trim(), op, right.trim()));
                 }
@@ -866,9 +951,10 @@ fn find_equality_position(text: &str) -> Option<usize> {
             '(' => depth += 1,
             ')' => depth -= 1,
             '=' if depth == 0 => {
-                // Check if this is part of !=, <=, or >=
-                let preceded_by_special = i > 0 && matches!(bytes[i - 1] as char, '!' | '<' | '>');
-                if !preceded_by_special {
+                // Check if this is part of !=, <=, >=, or ==
+                let preceded_by_special = i > 0 && matches!(bytes[i - 1] as char, '!' | '<' | '>' | '=');
+                let followed_by_equals = i + 1 < text.len() && bytes[i + 1] as char == '=';
+                if !preceded_by_special && !followed_by_equals {
                     return Some(i);
                 }
             }
@@ -1231,8 +1317,8 @@ mod tests {
         }
         // Verify operator was added to table
         assert!(file.operators.is_operator("&"));
-        let op = file.operators.get_operator("&").unwrap();
-        assert_eq!(op.precedence, 450);
+        let ops = file.operators.get_operators("&").unwrap();
+        assert_eq!(ops[0].precedence, 450);
     }
 
     #[test]

@@ -24,6 +24,8 @@ pub enum Formula {
     Or(Box<Formula>, Box<Formula>),
     /// Implication
     Implies(Box<Formula>, Box<Formula>),
+    /// Biconditional (if and only if)
+    Iff(Box<Formula>, Box<Formula>),
     /// Universal quantification
     Forall(String, Box<Formula>),
     /// Existential quantification
@@ -54,12 +56,24 @@ impl Formula {
     }
 
     /// Remove implications: A -> B becomes -A | B
+    /// Remove biconditionals: A <-> B becomes (A -> B) & (B -> A) becomes (-A | B) & (-B | A)
     fn remove_implications(&self) -> Formula {
         match self {
             Formula::Implies(a, b) => {
                 let not_a = Formula::Not(Box::new(a.remove_implications()));
                 let b_clean = b.remove_implications();
                 Formula::Or(Box::new(not_a), Box::new(b_clean))
+            }
+            Formula::Iff(a, b) => {
+                // A <-> B becomes (A -> B) & (B -> A)
+                // which becomes (-A | B) & (-B | A)
+                let a_clean = a.remove_implications();
+                let b_clean = b.remove_implications();
+                let not_a = Formula::Not(Box::new(a_clean.clone()));
+                let not_b = Formula::Not(Box::new(b_clean.clone()));
+                let left = Formula::Or(Box::new(not_a), Box::new(b_clean));
+                let right = Formula::Or(Box::new(not_b), Box::new(a_clean));
+                Formula::And(Box::new(left), Box::new(right))
             }
             Formula::Not(f) => Formula::Not(Box::new(f.remove_implications())),
             Formula::And(a, b) => Formula::And(
@@ -110,8 +124,9 @@ impl Formula {
                 }
                 // Atom: keep negation
                 Formula::Atom(_) => self.clone(),
-                // Should not have implications at this point
+                // Should not have implications/biconditionals at this point
                 Formula::Implies(_, _) => panic!("Implications should be removed before NNF"),
+                Formula::Iff(_, _) => panic!("Biconditionals should be removed before NNF"),
             },
             Formula::And(a, b) => Formula::And(
                 Box::new(a.to_negation_normal_form()),
@@ -129,6 +144,7 @@ impl Formula {
             }
             Formula::Atom(_) => self.clone(),
             Formula::Implies(_, _) => panic!("Implications should be removed before NNF"),
+            Formula::Iff(_, _) => panic!("Biconditionals should be removed before NNF"),
         }
     }
 
@@ -177,7 +193,8 @@ impl Formula {
                 Formula::Not(Box::new(f.skolemize(universal_vars, counter, symbols)))
             }
             Formula::Atom(_) => self.clone(),
-            Formula::Implies(_, _) => panic!("Implications should be removed before skolemization"),
+            Formula::Implies(_, _) => panic!("Implications should be removed before Skolemization"),
+            Formula::Iff(_, _) => panic!("Biconditionals should be removed before Skolemization"),
         }
     }
 
@@ -249,6 +266,10 @@ impl Formula {
                 Box::new(a.substitute_var(var, term)),
                 Box::new(b.substitute_var(var, term)),
             ),
+            Formula::Iff(a, b) => Formula::Iff(
+                Box::new(a.substitute_var(var, term)),
+                Box::new(b.substitute_var(var, term)),
+            ),
         }
     }
 
@@ -300,6 +321,7 @@ impl Formula {
             Formula::Atom(_) => self.clone(),
             Formula::Exists(_, _) => panic!("Existential quantifiers should be skolemized"),
             Formula::Implies(_, _) => panic!("Implications should be removed"),
+            Formula::Iff(_, _) => panic!("Biconditionals should be removed"),
         }
     }
 
@@ -406,12 +428,17 @@ impl<'a> FormulaParser<'a> {
         self.parse_implication()
     }
 
-    /// Parse implication (lowest precedence)
+    /// Parse implication and biconditional (lowest precedence)
     fn parse_implication(&mut self) -> Result<Formula, ParseError> {
         let left = self.parse_or()?;
 
         self.skip_whitespace();
-        if self.peek_str("->") {
+        // Check for biconditional first (it's longer than implication)
+        if self.peek_str("<->") {
+            self.advance(3);
+            let right = self.parse_implication()?;
+            Ok(Formula::Iff(Box::new(left), Box::new(right)))
+        } else if self.peek_str("->") {
             self.advance(2);
             let right = self.parse_implication()?;
             Ok(Formula::Implies(Box::new(left), Box::new(right)))
@@ -457,21 +484,74 @@ impl<'a> FormulaParser<'a> {
     }
 
     /// Parse quantifiers (all, exists)
+    /// Supports both single and multiple variables: all x (...) and all x y z (...)
     fn parse_quantifier(&mut self) -> Result<Formula, ParseError> {
         self.skip_whitespace();
 
         if self.peek_str("all ") {
             self.advance(4);
-            let var = self.parse_variable()?;
+            // Parse all variables until we hit something that's not a variable
+            let mut vars = Vec::new();
+            loop {
+                self.skip_whitespace();
+                // Check if we're at the start of the body (opening paren or formula)
+                if self.peek_char() == Some('(') || self.peek_char() == Some('-')
+                    || self.peek_str("all ") || self.peek_str("exists ") {
+                    break;
+                }
+                let var = self.parse_variable()?;
+                vars.push(var);
+            }
+
+            if vars.is_empty() {
+                return Err(ParseError {
+                    line: 0,
+                    column: self.pos,
+                    message: "Expected at least one variable after 'all'".to_string(),
+                });
+            }
+
+            // Parse the body once
             self.skip_whitespace();
-            let body = self.parse_quantifier()?;
-            Ok(Formula::Forall(var, Box::new(body)))
+            let mut body = self.parse_quantifier()?;
+
+            // Wrap in nested Forall quantifiers (right-to-left)
+            for var in vars.into_iter().rev() {
+                body = Formula::Forall(var, Box::new(body));
+            }
+            Ok(body)
         } else if self.peek_str("exists ") {
             self.advance(7);
-            let var = self.parse_variable()?;
+            // Parse all variables until we hit something that's not a variable
+            let mut vars = Vec::new();
+            loop {
+                self.skip_whitespace();
+                // Check if we're at the start of the body (opening paren or formula)
+                if self.peek_char() == Some('(') || self.peek_char() == Some('-')
+                    || self.peek_str("all ") || self.peek_str("exists ") {
+                    break;
+                }
+                let var = self.parse_variable()?;
+                vars.push(var);
+            }
+
+            if vars.is_empty() {
+                return Err(ParseError {
+                    line: 0,
+                    column: self.pos,
+                    message: "Expected at least one variable after 'exists'".to_string(),
+                });
+            }
+
+            // Parse the body once
             self.skip_whitespace();
-            let body = self.parse_quantifier()?;
-            Ok(Formula::Exists(var, Box::new(body)))
+            let mut body = self.parse_quantifier()?;
+
+            // Wrap in nested Exists quantifiers (right-to-left)
+            for var in vars.into_iter().rev() {
+                body = Formula::Exists(var, Box::new(body));
+            }
+            Ok(body)
         } else {
             self.parse_unary()
         }
@@ -536,6 +616,7 @@ impl<'a> FormulaParser<'a> {
                     self.pos += 1;
                 }
                 Some('&') | Some('|') if paren_depth == 0 => break,
+                Some('<') if paren_depth == 0 && self.peek_str("<->") => break,
                 Some('-') if paren_depth == 0 && self.peek_str("->") => break,
                 _ => self.pos += 1,
             }

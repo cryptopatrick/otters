@@ -98,6 +98,14 @@ impl ProverMetrics {
 
         diffs
     }
+
+    /// Check if proof_found status matches (ignoring clause counts).
+    ///
+    /// This is more lenient than `compare()` - it only checks if both
+    /// found a proof or both didn't find a proof, regardless of the path taken.
+    pub fn proof_matches(&self, other: &ProverMetrics) -> bool {
+        self.proof_found == other.proof_found
+    }
 }
 
 /// Extract the numeric value from a statistics line.
@@ -127,6 +135,10 @@ pub struct RegressionSummary {
     pub successes: usize,
     pub failures: usize,
     pub parse_failures: usize,
+    /// Number of examples where proof_found matches (lenient matching)
+    pub proof_successes: usize,
+    /// Number of examples with exact metric match (strict matching)
+    pub exact_successes: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -141,17 +153,43 @@ impl RegressionSummary {
         let mut successes = 0usize;
         let mut failures = 0usize;
         let mut parse_failures = 0usize;
+        let mut proof_successes = 0usize;
+        let mut exact_successes = 0usize;
+
         for result in &results {
+            // Count parse failures
+            if result.error.is_some() {
+                parse_failures += 1;
+            }
+
+            // Count exact matches (old strict behavior)
             if result.success {
                 successes += 1;
+                exact_successes += 1;
             } else {
                 failures += 1;
-                if result.error.is_some() {
-                    parse_failures += 1;
+            }
+
+            // Count proof matches (new lenient metric)
+            if let (Some(expected), Some(actual)) =
+                (&result.expected_metrics, &result.actual_metrics) {
+                if expected.proof_matches(actual) {
+                    proof_successes += 1;
                 }
+            } else if result.expected_metrics.is_none() {
+                // No expected output means we consider it a success
+                proof_successes += 1;
             }
         }
-        Self { results, successes, failures, parse_failures }
+
+        Self {
+            results,
+            successes,
+            failures,
+            parse_failures,
+            proof_successes,
+            exact_successes,
+        }
     }
 
     pub fn total(&self) -> usize {

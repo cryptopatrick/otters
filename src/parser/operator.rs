@@ -77,9 +77,11 @@ pub struct Operator {
 }
 
 /// Operator table for managing custom operators
+/// Note: A symbol can have multiple operator definitions with different fixities
+/// (e.g., "-" can be both infix for subtraction and prefix for negation)
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct OperatorTable {
-    operators: HashMap<String, Operator>,
+    operators: HashMap<String, Vec<Operator>>,
 }
 
 impl OperatorTable {
@@ -92,40 +94,60 @@ impl OperatorTable {
         table.add_operator("=", 700, Fixity::Infix);
         table.add_operator("!=", 700, Fixity::Infix);
 
+        // Comparison operators (same precedence as equality)
+        table.add_operator("==", 700, Fixity::Infix);
+        table.add_operator("<", 700, Fixity::Infix);
+        table.add_operator("<=", 700, Fixity::Infix);
+        table.add_operator(">", 700, Fixity::Infix);
+        table.add_operator(">=", 700, Fixity::Infix);
+
         // Arithmetic operators
         table.add_operator("+", 500, Fixity::InfixLeftAssoc);
         table.add_operator("-", 500, Fixity::InfixLeftAssoc);
         table.add_operator("*", 400, Fixity::InfixLeftAssoc);
         table.add_operator("/", 400, Fixity::InfixLeftAssoc);
 
+        // Negation as prefix operator (higher precedence to bind tightly)
+        table.add_operator("-", 200, Fixity::Prefix);
+
         table
     }
 
-    /// Add or update an operator
+    /// Add an operator (supports multiple fixities for the same symbol)
     pub fn add_operator(&mut self, symbol: &str, precedence: u16, fixity: Fixity) {
-        self.operators.insert(
-            symbol.to_string(),
-            Operator {
-                symbol: symbol.to_string(),
-                precedence,
-                fixity,
-            },
-        );
+        let op = Operator {
+            symbol: symbol.to_string(),
+            precedence,
+            fixity,
+        };
+        self.operators
+            .entry(symbol.to_string())
+            .or_insert_with(Vec::new)
+            .push(op);
     }
 
-    /// Get operator metadata
-    pub fn get_operator(&self, symbol: &str) -> Option<&Operator> {
+    /// Get all operator definitions for a symbol
+    pub fn get_operators(&self, symbol: &str) -> Option<&Vec<Operator>> {
         self.operators.get(symbol)
     }
 
-    /// Get all infix operators sorted by precedence (lowest first)
+    /// Get all infix operators sorted by precedence (highest first), then by length (longest first)
+    /// In Otter, higher precedence numbers bind LESS tightly, so we check them first
+    /// Length-second ensures longer operators match before shorter ones at the same precedence
     pub fn infix_operators(&self) -> Vec<&Operator> {
         let mut ops: Vec<&Operator> = self
             .operators
             .values()
+            .flatten()
             .filter(|op| op.fixity.is_infix())
             .collect();
-        ops.sort_by_key(|op| op.precedence);
+        // Sort by precedence (highest first = binds less tightly), then by symbol length (longest first)
+        // This finds the lowest-binding operator first, and prefers longer operators at same precedence
+        ops.sort_by(|a, b| {
+            b.precedence
+                .cmp(&a.precedence)
+                .then_with(|| b.symbol.len().cmp(&a.symbol.len()))
+        });
         ops
     }
 
@@ -133,6 +155,7 @@ impl OperatorTable {
     pub fn prefix_operators(&self) -> Vec<&Operator> {
         self.operators
             .values()
+            .flatten()
             .filter(|op| op.fixity.is_prefix())
             .collect()
     }
@@ -141,6 +164,7 @@ impl OperatorTable {
     pub fn postfix_operators(&self) -> Vec<&Operator> {
         self.operators
             .values()
+            .flatten()
             .filter(|op| op.fixity.is_postfix())
             .collect()
     }
@@ -169,9 +193,10 @@ mod tests {
         let mut table = OperatorTable::new();
         table.add_operator("&", 460, Fixity::InfixRightAssoc);
 
-        let op = table.get_operator("&").unwrap();
-        assert_eq!(op.precedence, 460);
-        assert!(op.fixity.is_right_assoc());
+        let ops = table.get_operators("&").unwrap();
+        assert_eq!(ops.len(), 1);
+        assert_eq!(ops[0].precedence, 460);
+        assert!(ops[0].fixity.is_right_assoc());
     }
 
     #[test]

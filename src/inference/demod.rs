@@ -2,8 +2,9 @@
 //!
 //! Demodulation simplifies terms by applying oriented equations as rewrite rules.
 
-use crate::data::{Clause, Literal, Term, VariableId};
+use crate::data::{Clause, Literal, LRPO, Term, VariableId};
 use crate::inference::{apply_to_literal, Substitution, Unifier};
+use std::cmp::Ordering;
 
 /// A demodulator (oriented equation used for rewriting).
 #[derive(Clone, Debug)]
@@ -131,10 +132,10 @@ pub fn demodulate_clause(clause: &Clause, demods: &[Demodulator]) -> Clause {
     new_clause
 }
 
-/// Extract demodulators from a clause.
+/// Extract demodulators from a clause using LRPO ordering.
 ///
 /// A clause can be used as a demodulator if it's a positive unit equality
-/// where the LHS is "heavier" than the RHS.
+/// where one side is greater than the other in LRPO ordering.
 pub fn extract_demodulator(clause: &Clause, eq_symbol: crate::data::SymbolId) -> Option<Demodulator> {
     // Must be a unit clause
     if clause.literals.len() != 1 {
@@ -154,15 +155,47 @@ pub fn extract_demodulator(clause: &Clause, eq_symbol: crate::data::SymbolId) ->
             let lhs = &args[0];
             let rhs = &args[1];
 
-            // Simple weight comparison: more complex term is LHS
-            // (In real Otter, this uses lexicographic path ordering)
-            if term_weight(lhs) >= term_weight(rhs) {
-                Some(Demodulator::new(lhs.clone(), rhs.clone()))
-            } else {
-                Some(Demodulator::new(rhs.clone(), lhs.clone()))
+            // Don't create demodulators for reflexivity (x = x)
+            if terms_equal(lhs, rhs) {
+                return None;
+            }
+
+            // Use LRPO to orient the equation: greater term becomes LHS
+            // This ensures termination by always rewriting to "smaller" terms
+            let lrpo = LRPO::new();
+            match lrpo.compare(lhs, rhs) {
+                Ordering::Greater => {
+                    // lhs > rhs: use lhs → rhs
+                    Some(Demodulator::new(lhs.clone(), rhs.clone()))
+                }
+                Ordering::Less => {
+                    // rhs > lhs: use rhs → lhs
+                    Some(Demodulator::new(rhs.clone(), lhs.clone()))
+                }
+                Ordering::Equal => {
+                    // Syntactically equal - should be caught by terms_equal above
+                    // But if not, don't create a demodulator
+                    None
+                }
             }
         }
         _ => None,
+    }
+}
+
+/// Check if two terms are structurally equal.
+fn terms_equal(t1: &Term, t2: &Term) -> bool {
+    match (t1, t2) {
+        (Term::Variable { id: id1, .. }, Term::Variable { id: id2, .. }) => id1 == id2,
+        (
+            Term::Application { symbol: s1, args: args1 },
+            Term::Application { symbol: s2, args: args2 },
+        ) => {
+            s1 == s2
+                && args1.len() == args2.len()
+                && args1.iter().zip(args2.iter()).all(|(a, b)| terms_equal(a, b))
+        }
+        _ => false,
     }
 }
 
