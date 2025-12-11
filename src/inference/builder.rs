@@ -1,9 +1,51 @@
 //! Builder to construct a prover from parsed Otter input.
 
-use crate::data::{ClauseArena, SymbolTable};
+use crate::data::{Clause, ClauseArena, SymbolId, SymbolTable, Term};
 use crate::data::symbol::SymbolKind;
 use crate::inference::{Prover, ProverConfig};
 use crate::parser::{ListSection, OtterCommand, OtterFile};
+
+/// Problem type characteristics detected from input clauses.
+#[derive(Debug)]
+struct ProblemType {
+    has_equality: bool,
+    max_literals: usize,
+    is_horn: bool,
+}
+
+/// Check if a clause contains an equality literal.
+fn clause_has_equality(clause: &Clause, eq_symbol: SymbolId) -> bool {
+    clause.literals.iter().any(|lit| {
+        if let Term::Application { symbol, args } = &lit.atom {
+            *symbol == eq_symbol && args.len() == 2
+        } else {
+            false
+        }
+    })
+}
+
+/// Check if a clause is a Horn clause (at most one positive literal).
+fn is_horn_clause(clause: &Clause) -> bool {
+    clause.literals.iter().filter(|lit| lit.sign).count() <= 1
+}
+
+/// Check if a clause is entirely positive (all literals positive).
+fn is_positive_clause(clause: &Clause) -> bool {
+    clause.literals.iter().all(|lit| lit.sign)
+}
+
+/// Detect problem type characteristics from clauses.
+fn detect_problem_type(clauses: &[Clause], eq_symbol: SymbolId) -> ProblemType {
+    let has_equality = clauses.iter().any(|c| clause_has_equality(c, eq_symbol));
+    let max_literals = clauses.iter().map(|c| c.literals.len()).max().unwrap_or(0);
+    let is_horn = clauses.iter().all(|c| is_horn_clause(c));
+
+    ProblemType {
+        has_equality,
+        max_literals,
+        is_horn,
+    }
+}
 
 /// Build a prover from parsed Otter input.
 pub struct ProverBuilder {
@@ -55,6 +97,10 @@ impl ProverBuilder {
                 self.config.use_hyper_res = true;
                 self.config.use_ur_res = true;
                 self.config.use_binary_res = true;
+                // EXPERIMENTAL: Enable linked UR to test if it helps (may have bugs)
+                self.config.use_linked_ur_res = true;
+                // Enable subsumption (always on in C Otter)
+                self.config.use_subsumption = true;
             }
             "hyper_res" => {
                 self.config.use_hyper_res = true;
@@ -71,18 +117,35 @@ impl ProverBuilder {
             "demod_inf" => {
                 self.config.use_demod = true;
             }
+            "back_demod" => {
+                self.config.use_back_demod = true;
+            }
             "factor" => {
                 self.config.use_factor = true;
             }
             "ur_res" => {
                 self.config.use_ur_res = true;
             }
+            "linked_ur_res" => {
+                self.config.use_linked_ur_res = true;
+            }
+            "unit_deletion" => {
+                self.config.use_unit_deletion = true;
+            }
             _ => {}
         }
     }
 
-    fn apply_clear_flag(&mut self, _flag: &str) {
-        // Handle clear flags
+    fn apply_clear_flag(&mut self, flag: &str) {
+        match flag {
+            "back_demod" => {
+                self.config.use_back_demod = false;
+            }
+            "demod_inf" => {
+                self.config.use_demod = false;
+            }
+            _ => {}
+        }
     }
 
     fn apply_assign(&mut self, name: &str, value: &str) {
@@ -173,21 +236,105 @@ impl ProverBuilder {
             }
         }
 
-        // In auto mode, if sos is empty but usable has clauses, move negative clauses to sos
-        if self.config.auto_mode && sos_clauses.is_empty() && !usable_clauses.is_empty() {
-            // Check for negative/goal clauses in usable
-            let mut remaining_usable = Vec::new();
-            for clause in usable_clauses {
-                // A clause with all negative literals, or containing a negative literal, is a goal
-                let has_negative = clause.literals.iter().any(|lit| !lit.sign);
-                if has_negative {
-                    sos_clauses.push(clause);
-                } else {
-                    remaining_usable.push(clause);
-                }
+        // Get equality symbol for detection
+        let eq_symbol = self.symbols.intern("=", 2, SymbolKind::Function);
+
+        // In auto mode, detect problem type and apply appropriate strategy
+        if self.config.auto_mode {
+            // Combine all clauses for analysis
+            let all_clauses: Vec<_> = usable_clauses.iter().chain(sos_clauses.iter()).cloned().collect();
+            let problem_type = detect_problem_type(&all_clauses, eq_symbol);
+
+            eprintln!(
+                "AUTO MODE: equality={}, max_lits={}, horn={}",
+                problem_type.has_equality, problem_type.max_literals, problem_type.is_horn
+            );
+
+            // Apply strategy based on problem type (mirrors C Otter automatic_1_settings)
+            if problem_type.has_equality && problem_type.max_literals == 1 {
+                // Pure equational (all units with equality) - KNUTH_BENDIX strategy
+                eprintln!("STRATEGY: Pure equational (Knuth-Bendix)");
+                self.config.use_para_from = true;
+                self.config.use_para_into = true;
+                self.config.use_demod = true;
+                self.config.use_back_demod = false; // DISABLED: causes severe performance issues
+                // Directional paramodulation (only left-to-right)
+                self.config.para_from_left = true;
+                self.config.para_from_right = false;
+                self.config.para_into_left = true;
+                self.config.para_into_right = false;
+                // Disable resolution for pure equality
+                self.config.use_binary_res = false;
+                self.config.use_hyper_res = false;
+                self.config.use_ur_res = false;
+            } else if problem_type.has_equality && !problem_type.is_horn {
+                // Non-Horn with equality
+                eprintln!("STRATEGY: Non-Horn with equality");
+                self.config.use_para_from = true;
+                self.config.use_para_into = true;
+                self.config.use_demod = true;
+                self.config.use_back_demod = false; // DISABLED: causes severe performance issues
+                // Directional paramodulation (only left-to-right)
+                self.config.para_from_left = true;
+                self.config.para_from_right = false;
+                self.config.para_into_left = true;
+                self.config.para_into_right = false;
+                self.config.use_hyper_res = true;
+                self.config.use_factor = true;
+                self.config.use_unit_deletion = true;  // Critical for non-Horn problems
+            } else if problem_type.has_equality && problem_type.is_horn {
+                // Horn with equality
+                eprintln!("STRATEGY: Horn with equality");
+                self.config.use_para_from = true;
+                self.config.use_para_into = true;
+                self.config.use_demod = true;
+                self.config.use_back_demod = false; // DISABLED: causes severe performance issues
+                // Directional paramodulation (only left-to-right)
+                self.config.para_from_left = true;
+                self.config.para_from_right = false;
+                self.config.para_into_left = true;
+                self.config.para_into_right = false;
+                self.config.use_hyper_res = true;
+            } else if !problem_type.is_horn {
+                // Non-Horn without equality
+                eprintln!("STRATEGY: Non-Horn without equality");
+                self.config.use_hyper_res = true;
+                self.config.use_factor = true;
+                self.config.use_unit_deletion = true;  // Critical for non-Horn problems
+            } else {
+                // Horn without equality
+                eprintln!("STRATEGY: Horn without equality");
+                self.config.use_hyper_res = true;
             }
-            usable_clauses = remaining_usable;
+
+            // In auto mode with equality, move positive clauses to SOS (like C Otter)
+            if problem_type.has_equality && sos_clauses.is_empty() && !usable_clauses.is_empty() {
+                let mut remaining_usable = Vec::new();
+                for clause in usable_clauses {
+                    if is_positive_clause(&clause) {
+                        sos_clauses.push(clause);
+                    } else {
+                        remaining_usable.push(clause);
+                    }
+                }
+                usable_clauses = remaining_usable;
+            } else if sos_clauses.is_empty() && !usable_clauses.is_empty() {
+                // Non-equality: move negative clauses to SOS
+                let mut remaining_usable = Vec::new();
+                for clause in usable_clauses {
+                    let has_negative = clause.literals.iter().any(|lit| !lit.sign);
+                    if has_negative {
+                        sos_clauses.push(clause);
+                    } else {
+                        remaining_usable.push(clause);
+                    }
+                }
+                usable_clauses = remaining_usable;
+            }
         }
+
+        // Rebuild prover with updated config
+        prover = Prover::with_config(self.config.clone());
 
         // Add clauses to prover
         for clause in usable_clauses {
@@ -198,7 +345,6 @@ impl ProverBuilder {
         }
 
         // Set equality symbol for paramodulation
-        let eq_symbol = self.symbols.intern("=", 2, SymbolKind::Function);
         prover.set_eq_symbol(eq_symbol);
 
         Ok(prover)

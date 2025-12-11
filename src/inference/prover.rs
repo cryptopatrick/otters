@@ -5,8 +5,9 @@
 
 use crate::data::{Clause, ClauseArena, ClauseId, ClauseList, SymbolId, WeightTable};
 use crate::inference::{
-    all_resolvents, demodulate_clause, extract_demodulator, factor_clause, hyperresolve_units,
-    paramodulate_into, ur_resolve, Demodulator,
+    all_resolvents, demodulate_clause, extract_demodulator, factor_clause, forward_subsumed,
+    forward_unit_deletion, hyperresolve_units, linked_ur_resolve, paramodulate_into, ur_resolve,
+    Demodulator, LinkedURConfig,
 };
 
 /// Result of a proof search.
@@ -56,12 +57,28 @@ pub struct ProverConfig {
     pub use_para_into: bool,
     /// Use paramodulation (para_from)
     pub use_para_from: bool,
+    /// Paramodulate from left side of equality (para_from_left)
+    pub para_from_left: bool,
+    /// Paramodulate from right side of equality (para_from_right)
+    pub para_from_right: bool,
+    /// Paramodulate into left side of equality (para_into_left)
+    pub para_into_left: bool,
+    /// Paramodulate into right side of equality (para_into_right)
+    pub para_into_right: bool,
     /// Use demodulation for term rewriting
     pub use_demod: bool,
+    /// Use back-demodulation to simplify existing clauses
+    pub use_back_demod: bool,
     /// Use factoring to simplify clauses
     pub use_factor: bool,
     /// Use UR-resolution (unit-resulting resolution)
     pub use_ur_res: bool,
+    /// Use Linked UR-resolution
+    pub use_linked_ur_res: bool,
+    /// Use subsumption to eliminate redundant clauses
+    pub use_subsumption: bool,
+    /// Use unit deletion to simplify clauses
+    pub use_unit_deletion: bool,
 }
 
 impl Default for ProverConfig {
@@ -76,9 +93,17 @@ impl Default for ProverConfig {
             use_binary_res: true,
             use_para_into: false,
             use_para_from: false,
+            para_from_left: true,
+            para_from_right: true,
+            para_into_left: true,
+            para_into_right: true,
             use_demod: false,
+            use_back_demod: false,
             use_factor: false,
             use_ur_res: false,
+            use_linked_ur_res: false,
+            use_subsumption: false,
+            use_unit_deletion: false,
         }
     }
 }
@@ -168,8 +193,10 @@ impl Prover {
         if self.config.use_demod {
             if let Some(eq_sym) = self.eq_symbol {
                 if let Some(demod) = extract_demodulator(&clause, eq_sym) {
-                    // Note: In full Otter, we'd also do back-demodulation here
-                    // (rewrite existing clauses with the new demodulator)
+                    // Apply back-demodulation: rewrite existing clauses with new demodulator
+                    if self.config.use_back_demod {
+                        self.back_demodulate(&demod);
+                    }
                     self.demodulators.push(demod);
                 }
             }
@@ -246,6 +273,42 @@ impl Prover {
             if let Some(clause) = self.arena.get(*clause_id) {
                 if let Some(demod) = extract_demodulator(clause, eq_sym) {
                     self.demodulators.push(demod);
+                }
+            }
+        }
+    }
+
+    /// Apply a new demodulator to all existing clauses (back-demodulation).
+    ///
+    /// This rewrites clauses in both usable and SOS with the new demodulator,
+    /// which can simplify the clause set and help find proofs faster.
+    fn back_demodulate(&mut self, new_demod: &Demodulator) {
+        // Apply to usable clauses
+        for clause_id in self.usable.iter() {
+            if let Some(clause) = self.arena.get(*clause_id).cloned() {
+                let simplified = demodulate_clause(&clause, &[new_demod.clone()]);
+
+                // Only update if the clause actually changed
+                if clause.literals != simplified.literals {
+                    if let Some(mut_clause) = self.arena.get_mut(*clause_id) {
+                        *mut_clause = simplified;
+                    }
+                }
+            }
+        }
+
+        // Apply to SOS clauses
+        for clause_id in self.sos.iter() {
+            if let Some(clause) = self.arena.get(*clause_id).cloned() {
+                let simplified = demodulate_clause(&clause, &[new_demod.clone()]);
+
+                // Only update if the clause actually changed
+                if clause.literals != simplified.literals {
+                    // Need to recalculate weight for SOS clauses since they may be selected
+                    if let Some(mut_clause) = self.arena.get_mut(*clause_id) {
+                        *mut_clause = simplified;
+                        mut_clause.pick_weight = self.weight_table.weight_clause(mut_clause);
+                    }
                 }
             }
         }
@@ -371,8 +434,39 @@ impl Prover {
                             };
                         }
 
+                        // Unit deletion: simplify clause using unit clauses
+                        let mut final_clause = processed;
+                        if self.config.use_unit_deletion {
+                            if let Some(unit_deleted) = forward_unit_deletion(
+                                &final_clause,
+                                None,
+                                &usable_clauses,
+                                &usable_ids.iter().map(|id| Some(*id)).collect::<Vec<_>>(),
+                            ) {
+                                final_clause = unit_deleted.clause;
+                                // Check again for empty clause after unit deletion
+                                if final_clause.literals.is_empty() {
+                                    let empty_id = self.arena.insert(final_clause);
+                                    self.clauses_kept += 1;
+                                    return ProofResult::Proof {
+                                        empty_clause_id: empty_id,
+                                        clauses_generated: self.clauses_generated,
+                                        clauses_kept: self.clauses_kept,
+                                    };
+                                }
+                            }
+                        }
+
+                        // Forward subsumption: check if new clause is subsumed by existing clauses
+                        if self.config.use_subsumption {
+                            let usable_refs: Vec<&Clause> = usable_clauses.iter().collect();
+                            if forward_subsumed(&final_clause, &usable_refs) {
+                                continue; // Skip this clause, it's subsumed
+                            }
+                        }
+
                         // Add to sos for further processing
-                        let new_id = self.arena.insert(processed);
+                        let new_id = self.arena.insert(final_clause);
                         self.sos.push(new_id);
                         self.clauses_kept += 1;
                     }
@@ -411,8 +505,39 @@ impl Prover {
                             };
                         }
 
+                        // Unit deletion: simplify clause using unit clauses
+                        let mut final_clause = processed;
+                        if self.config.use_unit_deletion {
+                            if let Some(unit_deleted) = forward_unit_deletion(
+                                &final_clause,
+                                None,
+                                &usable_clauses,
+                                &usable_ids.iter().map(|id| Some(*id)).collect::<Vec<_>>(),
+                            ) {
+                                final_clause = unit_deleted.clause;
+                                // Check again for empty clause after unit deletion
+                                if final_clause.literals.is_empty() {
+                                    let empty_id = self.arena.insert(final_clause);
+                                    self.clauses_kept += 1;
+                                    return ProofResult::Proof {
+                                        empty_clause_id: empty_id,
+                                        clauses_generated: self.clauses_generated,
+                                        clauses_kept: self.clauses_kept,
+                                    };
+                                }
+                            }
+                        }
+
+                        // Forward subsumption: check if new clause is subsumed by existing clauses
+                        if self.config.use_subsumption {
+                            let usable_refs: Vec<&Clause> = usable_clauses.iter().collect();
+                            if forward_subsumed(&final_clause, &usable_refs) {
+                                continue; // Skip this clause, it's subsumed
+                            }
+                        }
+
                         // Add to sos for further processing
-                        let new_id = self.arena.insert(processed);
+                        let new_id = self.arena.insert(final_clause);
                         self.sos.push(new_id);
                         self.clauses_kept += 1;
                     }
@@ -456,6 +581,43 @@ impl Prover {
                 }
             }
 
+            // Perform Linked UR-resolution if enabled
+            if self.config.use_linked_ur_res {
+                let linked_ur_config = LinkedURConfig::default();
+                let linked_ur_resolvents = linked_ur_resolve(
+                    &given_clause,
+                    Some(given_id),
+                    &usable_clauses,
+                    &linked_ur_config,
+                );
+
+                for resolvent in linked_ur_resolvents {
+                    self.clauses_generated += 1;
+
+                    // Process the clause
+                    let processed = match self.process_new_clause(resolvent.clause) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+
+                    // Check for empty clause
+                    if processed.literals.is_empty() {
+                        let empty_id = self.arena.insert(processed);
+                        self.clauses_kept += 1;
+                        return ProofResult::Proof {
+                            empty_clause_id: empty_id,
+                            clauses_generated: self.clauses_generated,
+                            clauses_kept: self.clauses_kept,
+                        };
+                    }
+
+                    // Add to sos
+                    let new_id = self.arena.insert(processed);
+                    self.sos.push(new_id);
+                    self.clauses_kept += 1;
+                }
+            }
+
             // Perform paramodulation if enabled and we have an equality symbol
             if (self.config.use_para_into || self.config.use_para_from) && self.eq_symbol.is_some() {
                 let eq_sym = self.eq_symbol.unwrap();
@@ -471,6 +633,10 @@ impl Prover {
                             usable_clause,
                             Some(*usable_id),
                             eq_sym,
+                            self.config.para_from_left,
+                            self.config.para_from_right,
+                            self.config.para_into_left,
+                            self.config.para_into_right,
                         );
 
                         for paramodulant in paramodulants {
@@ -506,6 +672,10 @@ impl Prover {
                             &given_clause,
                             Some(given_id),
                             eq_sym,
+                            self.config.para_from_left,
+                            self.config.para_from_right,
+                            self.config.para_into_left,
+                            self.config.para_into_right,
                         );
 
                         for paramodulant in paramodulants {

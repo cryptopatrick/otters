@@ -7,12 +7,14 @@ mod builder;
 mod demod;
 mod factor;
 mod hyper;
+mod linked_ur;
 mod output;
 mod para;
 mod prover;
 mod resolution;
 mod subsume;
 mod unify;
+mod unit_del;
 mod ur;
 
 pub use builder::ProverBuilder;
@@ -24,6 +26,7 @@ pub use factor::{factor_clause, Factor};
 pub use hyper::{
     hyperresolve, hyperresolve_units, neg_hyperresolve, neg_hyperresolve_units, HyperResolvent,
 };
+pub use linked_ur::{linked_ur_resolve, LinkedURConfig, LinkedURResolvent};
 pub use output::{OutputFormatter, ProverStats};
 pub use para::{paramodulate_into, Paramodulant};
 pub use prover::{ProofResult, Prover, ProverConfig};
@@ -33,4 +36,5 @@ pub use resolution::{
 };
 pub use subsume::{back_subsumed, forward_subsumed, subsumes};
 pub use unify::{unify, Substitution, UnificationError, Unifier};
+pub use unit_del::{forward_unit_deletion, unit_delete, UnitDeleted};
 pub use ur::{ur_resolve, URResolvent};
