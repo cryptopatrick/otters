@@ -132,6 +132,12 @@ impl ProverBuilder {
             "unit_deletion" => {
                 self.config.use_unit_deletion = true;
             }
+            "keep_hint_subsumers" => {
+                self.config.keep_hint_subsumers = true;
+            }
+            "keep_hint_equivalents" => {
+                self.config.keep_hint_equivalents = true;
+            }
             _ => {}
         }
     }
@@ -172,6 +178,41 @@ impl ProverBuilder {
                     self.config.max_clauses = (kb * 1024) / 100;
                 }
             }
+            "max_weight" => {
+                if let Ok(w) = value.parse::<i32>() {
+                    self.config.max_weight = w;
+                }
+            }
+            "fsub_hint_wt" => {
+                if let Ok(w) = value.parse::<i32>() {
+                    self.config.fsub_hint_wt = w;
+                }
+            }
+            "bsub_hint_wt" => {
+                if let Ok(w) = value.parse::<i32>() {
+                    self.config.bsub_hint_wt = w;
+                }
+            }
+            "equiv_hint_wt" => {
+                if let Ok(w) = value.parse::<i32>() {
+                    self.config.equiv_hint_wt = w;
+                }
+            }
+            "fsub_hint_add_wt" => {
+                if let Ok(w) = value.parse::<i32>() {
+                    self.config.fsub_hint_add_wt = w;
+                }
+            }
+            "bsub_hint_add_wt" => {
+                if let Ok(w) = value.parse::<i32>() {
+                    self.config.bsub_hint_add_wt = w;
+                }
+            }
+            "equiv_hint_add_wt" => {
+                if let Ok(w) = value.parse::<i32>() {
+                    self.config.equiv_hint_add_wt = w;
+                }
+            }
             _ => {}
         }
     }
@@ -187,6 +228,7 @@ impl ProverBuilder {
         // Collect clauses from all lists
         let mut usable_clauses = Vec::new();
         let mut sos_clauses = Vec::new();
+        let mut hint_clauses = Vec::new();
 
         // Process each list section
         for list in &file.lists {
@@ -227,7 +269,25 @@ impl ProverBuilder {
                         }
                     }
                 }
-                "passive" | "demodulators" | "hints" => {
+                "hints" => {
+                    // Process hints list
+                    let clause_list = match list.kind {
+                        crate::parser::ListKind::Formula => {
+                            list.to_clause_list_from_formulas(&mut arena, &self.symbols)
+                                .map_err(|e| e.to_string())?
+                        }
+                        _ => {
+                            list.to_clause_list(&mut arena, &self.symbols, &file.operators)
+                                .map_err(|e| e.to_string())?
+                        }
+                    };
+                    for id in clause_list.iter() {
+                        if let Some(clause) = arena.get(*id) {
+                            hint_clauses.push(clause.clone());
+                        }
+                    }
+                }
+                "passive" | "demodulators" => {
                     // These lists are recognized but not yet implemented
                 }
                 _ => {
@@ -342,6 +402,11 @@ impl ProverBuilder {
         }
         for clause in sos_clauses {
             prover.add_sos(clause);
+        }
+
+        // Add hints to prover
+        for clause in hint_clauses {
+            prover.add_hint(clause);
         }
 
         // Set equality symbol for paramodulation

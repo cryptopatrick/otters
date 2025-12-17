@@ -79,6 +79,24 @@ pub struct ProverConfig {
     pub use_subsumption: bool,
     /// Use unit deletion to simplify clauses
     pub use_unit_deletion: bool,
+    /// Maximum weight for clauses (higher weight clauses are discarded)
+    pub max_weight: i32,
+    /// Weight for forward subsumption hint matching
+    pub fsub_hint_wt: i32,
+    /// Additive weight for forward subsumption hint matching
+    pub fsub_hint_add_wt: i32,
+    /// Weight for back subsumption hint matching
+    pub bsub_hint_wt: i32,
+    /// Additive weight for back subsumption hint matching
+    pub bsub_hint_add_wt: i32,
+    /// Weight for equivalence hint matching
+    pub equiv_hint_wt: i32,
+    /// Additive weight for equivalence hint matching
+    pub equiv_hint_add_wt: i32,
+    /// Keep clauses that subsume hints despite exceeding max weight
+    pub keep_hint_subsumers: bool,
+    /// Keep clauses that are equivalent to hints despite exceeding max weight
+    pub keep_hint_equivalents: bool,
 }
 
 impl Default for ProverConfig {
@@ -104,6 +122,15 @@ impl Default for ProverConfig {
             use_linked_ur_res: false,
             use_subsumption: false,
             use_unit_deletion: false,
+            max_weight: i32::MAX,
+            fsub_hint_wt: crate::inference::MAX_WEIGHT,
+            fsub_hint_add_wt: 0,
+            bsub_hint_wt: crate::inference::MAX_WEIGHT,
+            bsub_hint_add_wt: -1000,
+            equiv_hint_wt: crate::inference::MAX_WEIGHT,
+            equiv_hint_add_wt: 0,
+            keep_hint_subsumers: false,
+            keep_hint_equivalents: false,
         }
     }
 }
@@ -124,6 +151,8 @@ pub struct Prover {
     demodulators: Vec<Demodulator>,
     /// Symbol weight table for clause selection
     weight_table: WeightTable,
+    /// Hints for guiding the search
+    hints: crate::inference::HintsList,
     /// Statistics
     clauses_generated: usize,
     clauses_kept: usize,
@@ -148,6 +177,7 @@ impl Prover {
             eq_symbol: None,
             demodulators: Vec::new(),
             weight_table: WeightTable::new(),
+            hints: crate::inference::HintsList::new(),
             clauses_generated: 0,
             clauses_kept: 0,
             given_count: 0,
@@ -168,6 +198,19 @@ impl Prover {
     /// Set the equality symbol for paramodulation.
     pub fn set_eq_symbol(&mut self, sym: SymbolId) {
         self.eq_symbol = Some(sym);
+    }
+
+    /// Add a hint clause to guide the search.
+    pub fn add_hint(&mut self, clause: Clause) {
+        let hint_data = crate::inference::HintData::new(
+            self.config.fsub_hint_wt,
+            self.config.fsub_hint_add_wt,
+            self.config.bsub_hint_wt,
+            self.config.bsub_hint_add_wt,
+            self.config.equiv_hint_wt,
+            self.config.equiv_hint_add_wt,
+        );
+        self.hints.add_hint(clause, hint_data);
     }
 
     /// Process a new clause: apply factoring, demodulation, and check if it's a demodulator.
@@ -205,15 +248,87 @@ impl Prover {
         Some(clause)
     }
 
-    /// Add a clause to the set of support.
+    /// Add an input/initial clause to the set of support.
+    ///
+    /// Input clauses are not subject to max_weight filtering.
     pub fn add_sos(&mut self, mut clause: Clause) -> ClauseId {
         // Cache the weight for efficient clause selection
         clause.pick_weight = self.weight_table.weight_clause(&clause);
 
+        // Adjust weight based on hints if they match (for priority)
+        if !self.hints.is_empty() {
+            crate::inference::adjust_weight_with_hints(&mut clause, &self.hints);
+        }
+
+        // Input clauses bypass max_weight check
         let id = self.arena.insert(clause);
         self.sos.push(id);
         self.clauses_kept += 1;
         id
+    }
+
+    /// Add an inferred clause to the set of support.
+    ///
+    /// Returns Some(id) if the clause was added, None if it was discarded (e.g., exceeds max_weight).
+    pub fn add_inferred_sos(&mut self, mut clause: Clause) -> Option<ClauseId> {
+        // Cache the weight for efficient clause selection
+        clause.pick_weight = self.weight_table.weight_clause(&clause);
+
+        // Adjust weight based on hints if they match
+        if !self.hints.is_empty() {
+            crate::inference::adjust_weight_with_hints(&mut clause, &self.hints);
+        }
+
+        // Check max_weight constraint for inferred clauses
+        if self.config.max_weight < i32::MAX && clause.pick_weight > self.config.max_weight {
+            // Clause exceeds max_weight - check if it should be kept due to hints
+            let keep = crate::inference::hint_keep_test(
+                &clause,
+                &self.hints,
+                self.config.keep_hint_subsumers,
+                self.config.keep_hint_equivalents,
+            );
+            if !keep {
+                return None; // Discard clause
+            }
+        }
+
+        let id = self.arena.insert(clause);
+        self.sos.push(id);
+        self.clauses_kept += 1;
+        Some(id)
+    }
+
+    /// Try to add a processed inferred clause to SOS.
+    ///
+    /// This applies max_weight filtering and hint checks. Returns true if added, false if discarded.
+    fn try_keep_clause(&mut self, mut clause: Clause) -> bool {
+        // Cache the weight for efficient clause selection
+        clause.pick_weight = self.weight_table.weight_clause(&clause);
+
+        // Adjust weight based on hints if they match
+        if !self.hints.is_empty() {
+            crate::inference::adjust_weight_with_hints(&mut clause, &self.hints);
+        }
+
+        // Check max_weight constraint for inferred clauses
+        if self.config.max_weight < i32::MAX && clause.pick_weight > self.config.max_weight {
+            // Clause exceeds max_weight - check if it should be kept due to hints
+            let keep = crate::inference::hint_keep_test(
+                &clause,
+                &self.hints,
+                self.config.keep_hint_subsumers,
+                self.config.keep_hint_equivalents,
+            );
+            if !keep {
+                return false; // Discard clause
+            }
+        }
+
+        let id = self.arena.insert(clause);
+        self.sos.push(id);
+        self.clauses_kept += 1;
+        true
     }
 
     /// Add a clause to the usable set.
@@ -465,10 +580,8 @@ impl Prover {
                             }
                         }
 
-                        // Add to sos for further processing
-                        let new_id = self.arena.insert(final_clause);
-                        self.sos.push(new_id);
-                        self.clauses_kept += 1;
+                        // Add to sos for further processing (with max_weight filtering)
+                        self.try_keep_clause(final_clause);
                     }
                 }
             }
@@ -536,10 +649,8 @@ impl Prover {
                             }
                         }
 
-                        // Add to sos for further processing
-                        let new_id = self.arena.insert(final_clause);
-                        self.sos.push(new_id);
-                        self.clauses_kept += 1;
+                        // Add to sos for further processing (with max_weight filtering)
+                        self.try_keep_clause(final_clause);
                     }
                 }
             }
@@ -574,10 +685,8 @@ impl Prover {
                         };
                     }
 
-                    // Add to sos
-                    let new_id = self.arena.insert(processed);
-                    self.sos.push(new_id);
-                    self.clauses_kept += 1;
+                    // Add to sos (with max_weight filtering)
+                    self.try_keep_clause(processed);
                 }
             }
 
@@ -611,10 +720,8 @@ impl Prover {
                         };
                     }
 
-                    // Add to sos
-                    let new_id = self.arena.insert(processed);
-                    self.sos.push(new_id);
-                    self.clauses_kept += 1;
+                    // Add to sos (with max_weight filtering)
+                    self.try_keep_clause(processed);
                 }
             }
 
@@ -658,9 +765,8 @@ impl Prover {
                                 };
                             }
 
-                            let new_id = self.arena.insert(processed);
-                            self.sos.push(new_id);
-                            self.clauses_kept += 1;
+                            // Add to sos (with max_weight filtering)
+                            self.try_keep_clause(processed);
                         }
                     }
 
@@ -697,9 +803,8 @@ impl Prover {
                                 };
                             }
 
-                            let new_id = self.arena.insert(processed);
-                            self.sos.push(new_id);
-                            self.clauses_kept += 1;
+                            // Add to sos (with max_weight filtering)
+                            self.try_keep_clause(processed);
                         }
                     }
                 }

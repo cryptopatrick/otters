@@ -6,6 +6,7 @@
 mod builder;
 mod demod;
 mod factor;
+mod hints;
 mod hyper;
 mod linked_ur;
 mod output;
@@ -23,6 +24,7 @@ pub use demod::{
     Demodulator,
 };
 pub use factor::{factor_clause, Factor};
+pub use hints::{adjust_weight_with_hints, hint_keep_test, HintData, HintsList, MAX_WEIGHT};
 pub use hyper::{
     hyperresolve, hyperresolve_units, neg_hyperresolve, neg_hyperresolve_units, HyperResolvent,
 };
