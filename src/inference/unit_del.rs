@@ -171,21 +171,15 @@ mod tests {
         let a = symbols.intern("a", 0, SymbolKind::Constant);
 
         // Clause: P(x) | Q(x)
-        let clause = Clause {
-            literals: vec![
-                Literal::new(true, Term::application(p, vec![Term::variable(VariableId::new(0))])),
-                Literal::new(true, Term::application(q, vec![Term::variable(VariableId::new(0))])),
-            ],
-            ..Default::default()
-        };
+        let clause = Clause::new(vec![
+            Literal::new(true, Term::application(p, vec![Term::variable(VariableId::new(0))])),
+            Literal::new(true, Term::application(q, vec![Term::variable(VariableId::new(0))])),
+        ]);
 
         // Unit: ~P(a)
-        let unit = Clause {
-            literals: vec![
-                Literal::new(false, Term::application(p, vec![Term::application(a, vec![])])),
-            ],
-            ..Default::default()
-        };
+        let unit = Clause::new(vec![
+            Literal::new(false, Term::application(p, vec![Term::application(a, vec![])])),
+        ]);
 
         let result = unit_delete(&clause, None, &[unit], &[None]);
         assert!(result.is_some());
@@ -202,20 +196,14 @@ mod tests {
         let a = symbols.intern("a", 0, SymbolKind::Constant);
 
         // Clause: P(x) | Q(x)
-        let clause = Clause {
-            literals: vec![
-                Literal::new(true, Term::application(p, vec![Term::variable(VariableId::new(0))])),
-            ],
-            ..Default::default()
-        };
+        let clause = Clause::new(vec![
+            Literal::new(true, Term::application(p, vec![Term::variable(VariableId::new(0))])),
+        ]);
 
         // Unit: P(a) (same sign - should not delete)
-        let unit = Clause {
-            literals: vec![
-                Literal::new(true, Term::application(p, vec![Term::application(a, vec![])])),
-            ],
-            ..Default::default()
-        };
+        let unit = Clause::new(vec![
+            Literal::new(true, Term::application(p, vec![Term::application(a, vec![])])),
+        ]);
 
         let result = unit_delete(&clause, None, &[unit], &[None]);
         // Should not delete (same sign)
@@ -229,20 +217,14 @@ mod tests {
         let a = symbols.intern("a", 0, SymbolKind::Constant);
 
         // Unit clause: P(a)
-        let clause = Clause {
-            literals: vec![
-                Literal::new(true, Term::application(p, vec![Term::application(a, vec![])])),
-            ],
-            ..Default::default()
-        };
+        let clause = Clause::new(vec![
+            Literal::new(true, Term::application(p, vec![Term::application(a, vec![])])),
+        ]);
 
         // Unit: ~P(a)
-        let unit = Clause {
-            literals: vec![
-                Literal::new(false, Term::application(p, vec![Term::application(a, vec![])])),
-            ],
-            ..Default::default()
-        };
+        let unit = Clause::new(vec![
+            Literal::new(false, Term::application(p, vec![Term::application(a, vec![])])),
+        ]);
 
         // Should not apply to unit clauses
         let result = unit_delete(&clause, None, &[unit], &[None]);

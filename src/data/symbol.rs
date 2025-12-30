@@ -36,6 +36,10 @@ pub struct Symbol {
     pub name: String,
     pub arity: u8,
     pub kind: SymbolKind,
+    /// Lex value for symbol precedence ordering (i32::MAX = unspecified)
+    pub lex_val: i32,
+    /// Flag indicating special unary function (transparent to lex ordering)
+    pub special_unary: bool,
 }
 
 impl Symbol {
@@ -45,7 +49,14 @@ impl Symbol {
         arity: u8,
         kind: SymbolKind,
     ) -> Self {
-        Self { id, name: name.into(), arity, kind }
+        Self {
+            id,
+            name: name.into(),
+            arity,
+            kind,
+            lex_val: i32::MAX,  // Unspecified by default
+            special_unary: false,
+        }
     }
 }
 
@@ -111,6 +122,46 @@ impl SymbolTable {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Set lex value for all symbols with the given name (regardless of arity).
+    pub fn set_lex_val_by_name(&self, name: &str, lex_val: i32) {
+        let mut guard = self.symbols.write().expect("symbol table poisoned");
+        for symbol in guard.values_mut() {
+            if symbol.name == name {
+                symbol.lex_val = lex_val;
+            }
+        }
+    }
+
+    /// Set special_unary flag for all symbols with the given name (regardless of arity).
+    pub fn set_special_unary_by_name(&self, name: &str, special_unary: bool) {
+        let mut guard = self.symbols.write().expect("symbol table poisoned");
+        for symbol in guard.values_mut() {
+            if symbol.name == name {
+                symbol.special_unary = special_unary;
+            }
+        }
+    }
+
+    /// Get lex value for a symbol by ID.
+    pub fn get_lex_val(&self, id: SymbolId) -> i32 {
+        self.get(id).map(|s| s.lex_val).unwrap_or(i32::MAX)
+    }
+
+    /// Check if a symbol has special_unary set.
+    pub fn is_special_unary(&self, id: SymbolId) -> bool {
+        self.get(id).map(|s| s.special_unary).unwrap_or(false)
+    }
+
+    /// Get all symbol IDs with a given name (regardless of arity).
+    pub fn get_ids_by_name(&self, name: &str) -> Vec<SymbolId> {
+        let guard = self.symbols.read().expect("symbol table poisoned");
+        guard
+            .values()
+            .filter(|s| s.name == name)
+            .map(|s| s.id)
+            .collect()
     }
 }
 

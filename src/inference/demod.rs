@@ -136,7 +136,13 @@ pub fn demodulate_clause(clause: &Clause, demods: &[Demodulator]) -> Clause {
 ///
 /// A clause can be used as a demodulator if it's a positive unit equality
 /// where one side is greater than the other in LRPO ordering.
-pub fn extract_demodulator(clause: &Clause, eq_symbol: crate::data::SymbolId) -> Option<Demodulator> {
+///
+/// If `lrpo` is None, a default LRPO ordering is used.
+pub fn extract_demodulator(
+    clause: &Clause,
+    eq_symbol: crate::data::SymbolId,
+    lrpo: Option<&LRPO>,
+) -> Option<Demodulator> {
     // Must be a unit clause
     if clause.literals.len() != 1 {
         return None;
@@ -162,8 +168,15 @@ pub fn extract_demodulator(clause: &Clause, eq_symbol: crate::data::SymbolId) ->
 
             // Use LRPO to orient the equation: greater term becomes LHS
             // This ensures termination by always rewriting to "smaller" terms
-            let lrpo = LRPO::new();
-            match lrpo.compare(lhs, rhs) {
+            let default_lrpo;
+            let ordering = match lrpo {
+                Some(o) => o,
+                None => {
+                    default_lrpo = LRPO::new();
+                    &default_lrpo
+                }
+            };
+            match ordering.compare(lhs, rhs) {
                 Ordering::Greater => {
                     // lhs > rhs: use lhs → rhs
                     Some(Demodulator::new(lhs.clone(), rhs.clone()))
@@ -310,7 +323,7 @@ mod tests {
         let eq = Term::application(eq_sym, vec![f_a.clone(), b.clone()]);
         let clause = Clause::new(vec![Literal::new(true, eq)]);
 
-        let demod = extract_demodulator(&clause, eq_sym);
+        let demod = extract_demodulator(&clause, eq_sym, None);
         assert!(demod.is_some());
 
         let demod = demod.unwrap();

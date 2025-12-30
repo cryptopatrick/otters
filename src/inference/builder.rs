@@ -51,6 +51,10 @@ fn detect_problem_type(clauses: &[Clause], eq_symbol: SymbolId) -> ProblemType {
 pub struct ProverBuilder {
     config: ProverConfig,
     symbols: SymbolTable,
+    /// Lex ordering symbols (stored until symbols are interned)
+    lex_symbols: Vec<String>,
+    /// Special unary symbols
+    special_unary_symbols: Vec<String>,
 }
 
 impl ProverBuilder {
@@ -59,6 +63,8 @@ impl ProverBuilder {
         Self {
             config: ProverConfig::default(),
             symbols: SymbolTable::new(),
+            lex_symbols: Vec::new(),
+            special_unary_symbols: Vec::new(),
         }
     }
 
@@ -80,6 +86,10 @@ impl ProverBuilder {
                 }
                 OtterCommand::Assign { name, value } => {
                     self.apply_assign(name, value);
+                }
+                OtterCommand::Lex { symbols } => {
+                    // Store lex symbols for later processing after symbols are interned
+                    self.lex_symbols = symbols.clone();
                 }
                 _ => {}
             }
@@ -317,7 +327,7 @@ impl ProverBuilder {
                 self.config.use_para_from = true;
                 self.config.use_para_into = true;
                 self.config.use_demod = true;
-                self.config.use_back_demod = false; // DISABLED: causes severe performance issues
+                self.config.use_back_demod = true; // Enabled for Knuth-Bendix
                 // Directional paramodulation (only left-to-right)
                 self.config.para_from_left = true;
                 self.config.para_from_right = false;
@@ -393,8 +403,34 @@ impl ProverBuilder {
             }
         }
 
+        // Apply lex ordering to symbols (lower index = smaller in ordering)
+        // In Otter, lex([a, b, c]) means a < b < c
+        for (idx, symbol_name) in self.lex_symbols.iter().enumerate() {
+            // Lex value: lower index = lower value = smaller in ordering
+            // We use (idx + 1) so that specified symbols have values 1, 2, 3, ...
+            // and unspecified symbols have i32::MAX (largest)
+            self.symbols.set_lex_val_by_name(symbol_name, (idx + 1) as i32);
+        }
+
+        // Apply special_unary flags
+        for symbol_name in &self.special_unary_symbols {
+            self.symbols.set_special_unary_by_name(symbol_name, true);
+        }
+
         // Rebuild prover with updated config
         prover = Prover::with_config(self.config.clone());
+
+        // Set symbol precedence from lex ordering
+        // In LRPO, lower precedence value = higher precedence (comes first in comparison)
+        // Lex ordering: lex([a, b, c]) means a < b < c (a is smallest)
+        // For demodulation to work correctly, we want larger terms to rewrite to smaller
+        // So we give smaller (earlier) lex symbols higher precedence (lower value)
+        for (idx, symbol_name) in self.lex_symbols.iter().enumerate() {
+            for sym_id in self.symbols.get_ids_by_name(symbol_name) {
+                // Lower idx = smaller in lex ordering = higher precedence = lower prec value
+                prover.set_symbol_precedence(sym_id, idx as u32);
+            }
+        }
 
         // Add clauses to prover
         for clause in usable_clauses {

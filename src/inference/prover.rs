@@ -3,7 +3,7 @@
 //! This module provides a simple saturation-based prover that uses binary
 //! resolution to search for contradictions (empty clauses).
 
-use crate::data::{Clause, ClauseArena, ClauseId, ClauseList, SymbolId, WeightTable};
+use crate::data::{Clause, ClauseArena, ClauseId, ClauseList, LRPO, SymbolId, WeightTable};
 use crate::inference::{
     all_resolvents, demodulate_clause, extract_demodulator, factor_clause, forward_subsumed,
     forward_unit_deletion, hyperresolve_units, linked_ur_resolve, paramodulate_into, ur_resolve,
@@ -151,6 +151,8 @@ pub struct Prover {
     demodulators: Vec<Demodulator>,
     /// Symbol weight table for clause selection
     weight_table: WeightTable,
+    /// Term ordering for demodulation and paramodulation
+    lrpo: LRPO,
     /// Hints for guiding the search
     hints: crate::inference::HintsList,
     /// Statistics
@@ -159,6 +161,8 @@ pub struct Prover {
     given_count: usize,
     /// Counter for pick_given_ratio (tracks when to select by FIFO vs weight)
     pick_count: usize,
+    /// Proof found during back-demodulation (t != t contradiction)
+    proof_from_back_demod: Option<ClauseId>,
 }
 
 impl Prover {
@@ -177,11 +181,13 @@ impl Prover {
             eq_symbol: None,
             demodulators: Vec::new(),
             weight_table: WeightTable::new(),
+            lrpo: LRPO::new(),
             hints: crate::inference::HintsList::new(),
             clauses_generated: 0,
             clauses_kept: 0,
             given_count: 0,
             pick_count: 0,
+            proof_from_back_demod: None,
         }
     }
 
@@ -198,6 +204,11 @@ impl Prover {
     /// Set the equality symbol for paramodulation.
     pub fn set_eq_symbol(&mut self, sym: SymbolId) {
         self.eq_symbol = Some(sym);
+    }
+
+    /// Set symbol precedence for term ordering (lower value = higher precedence).
+    pub fn set_symbol_precedence(&mut self, sym: SymbolId, prec: u32) {
+        self.lrpo.set_precedence(sym, prec);
     }
 
     /// Add a hint clause to guide the search.
@@ -232,10 +243,30 @@ impl Prover {
             clause = demodulate_clause(&clause, &self.demodulators);
         }
 
+        // Check for xx_res: negated reflexive equality (t != t) is immediately false
+        // This gives an empty clause (proof found)
+        if let Some(eq_sym) = self.eq_symbol {
+            if clause.literals.len() == 1 {
+                let lit = &clause.literals[0];
+                if !lit.sign {
+                    // Negated literal
+                    if let crate::data::Term::Application { symbol, args } = &lit.atom {
+                        if *symbol == eq_sym && args.len() == 2 {
+                            // Check if both sides are syntactically equal
+                            if args[0] == args[1] {
+                                // t != t is a contradiction - return empty clause
+                                return Some(Clause::new(vec![]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Check if this clause is a demodulator
         if self.config.use_demod {
             if let Some(eq_sym) = self.eq_symbol {
-                if let Some(demod) = extract_demodulator(&clause, eq_sym) {
+                if let Some(demod) = extract_demodulator(&clause, eq_sym, Some(&self.lrpo)) {
                     // Apply back-demodulation: rewrite existing clauses with new demodulator
                     if self.config.use_back_demod {
                         self.back_demodulate(&demod);
@@ -386,7 +417,7 @@ impl Prover {
         // Extract demodulators from usable clauses
         for clause_id in self.usable.iter() {
             if let Some(clause) = self.arena.get(*clause_id) {
-                if let Some(demod) = extract_demodulator(clause, eq_sym) {
+                if let Some(demod) = extract_demodulator(clause, eq_sym, Some(&self.lrpo)) {
                     self.demodulators.push(demod);
                 }
             }
@@ -397,7 +428,10 @@ impl Prover {
     ///
     /// This rewrites clauses in both usable and SOS with the new demodulator,
     /// which can simplify the clause set and help find proofs faster.
+    /// If a t != t contradiction is found, sets proof_from_back_demod.
     fn back_demodulate(&mut self, new_demod: &Demodulator) {
+        let eq_sym = self.eq_symbol;
+
         // Apply to usable clauses
         for clause_id in self.usable.iter() {
             if let Some(clause) = self.arena.get(*clause_id).cloned() {
@@ -405,6 +439,24 @@ impl Prover {
 
                 // Only update if the clause actually changed
                 if clause.literals != simplified.literals {
+                    // Check for xx_res: t != t becomes empty clause
+                    if let Some(eq_s) = eq_sym {
+                        if simplified.literals.len() == 1 {
+                            let lit = &simplified.literals[0];
+                            if !lit.sign {
+                                if let crate::data::Term::Application { symbol, args } = &lit.atom {
+                                    if *symbol == eq_s && args.len() == 2 && args[0] == args[1] {
+                                        // Found t != t - create empty clause
+                                        let empty = Clause::new(vec![]);
+                                        let empty_id = self.arena.insert(empty);
+                                        self.proof_from_back_demod = Some(empty_id);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     if let Some(mut_clause) = self.arena.get_mut(*clause_id) {
                         *mut_clause = simplified;
                     }
@@ -419,6 +471,24 @@ impl Prover {
 
                 // Only update if the clause actually changed
                 if clause.literals != simplified.literals {
+                    // Check for xx_res: t != t becomes empty clause
+                    if let Some(eq_s) = eq_sym {
+                        if simplified.literals.len() == 1 {
+                            let lit = &simplified.literals[0];
+                            if !lit.sign {
+                                if let crate::data::Term::Application { symbol, args } = &lit.atom {
+                                    if *symbol == eq_s && args.len() == 2 && args[0] == args[1] {
+                                        // Found t != t - create empty clause
+                                        let empty = Clause::new(vec![]);
+                                        let empty_id = self.arena.insert(empty);
+                                        self.proof_from_back_demod = Some(empty_id);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     // Need to recalculate weight for SOS clauses since they may be selected
                     if let Some(mut_clause) = self.arena.get_mut(*clause_id) {
                         *mut_clause = simplified;
@@ -431,10 +501,22 @@ impl Prover {
 
     /// Run the proof search.
     pub fn search(&mut self) -> ProofResult {
+        eprintln!("DEBUG: Starting search, SOS={}, usable={}", self.sos.len(), self.usable.len());
         // Pre-process to extract initial demodulators
         self.preprocess_initial_clauses();
+        eprintln!("DEBUG: After preprocess, demodulators={}", self.demodulators.len());
 
         while !self.sos.is_empty() {
+            // Check if back-demodulation found a proof (t != t contradiction)
+            if let Some(empty_id) = self.proof_from_back_demod.take() {
+                self.clauses_kept += 1;
+                return ProofResult::Proof {
+                    empty_clause_id: empty_id,
+                    clauses_generated: self.clauses_generated,
+                    clauses_kept: self.clauses_kept,
+                };
+            }
+
             // Check resource limits
             if self.given_count >= self.config.max_given {
                 return ProofResult::ResourceLimit {
@@ -469,6 +551,7 @@ impl Prover {
             };
 
             self.given_count += 1;
+            eprintln!("DEBUG: Given #{}, SOS={}, usable={}", self.given_count, self.sos.len(), self.usable.len());
 
             // Get the given clause
             let given_clause = match self.arena.get(given_id) {
@@ -476,12 +559,37 @@ impl Prover {
                 None => continue,
             };
 
+            // Extract demodulator from given clause if it's a unit equality
+            // This is critical for Knuth-Bendix completion
+            if self.config.use_demod {
+                if let Some(eq_sym) = self.eq_symbol {
+                    if let Some(demod) = extract_demodulator(&given_clause, eq_sym, Some(&self.lrpo)) {
+                        // Apply back-demodulation with new demodulator
+                        if self.config.use_back_demod {
+                            self.back_demodulate(&demod);
+                            // Check if back-demod found a proof (t != t contradiction)
+                            if let Some(empty_id) = self.proof_from_back_demod.take() {
+                                self.clauses_kept += 1;
+                                return ProofResult::Proof {
+                                    empty_clause_id: empty_id,
+                                    clauses_generated: self.clauses_generated,
+                                    clauses_kept: self.clauses_kept,
+                                };
+                            }
+                        }
+                        self.demodulators.push(demod);
+                    }
+                }
+            }
+
             // Collect usable clauses for inference
-            let usable_ids: Vec<_> = self.usable.iter().cloned().collect();
-            let usable_clauses: Vec<Clause> = usable_ids
+            // Build paired list to ensure IDs and clauses stay in sync
+            let usable_pairs: Vec<(ClauseId, Clause)> = self.usable
                 .iter()
-                .filter_map(|id| self.arena.get(*id).cloned())
+                .filter_map(|id| self.arena.get(*id).cloned().map(|c| (*id, c)))
                 .collect();
+            let usable_ids: Vec<ClauseId> = usable_pairs.iter().map(|(id, _)| *id).collect();
+            let usable_clauses: Vec<Clause> = usable_pairs.into_iter().map(|(_, c)| c).collect();
             let usable_id_opts: Vec<Option<ClauseId>> = usable_ids.iter().map(|id| Some(*id)).collect();
 
             // Perform hyperresolution if enabled
@@ -765,6 +873,14 @@ impl Prover {
                                 };
                             }
 
+                            // Forward subsumption: check if new clause is subsumed by existing clauses
+                            if self.config.use_subsumption {
+                                let usable_refs: Vec<&Clause> = usable_clauses.iter().collect();
+                                if forward_subsumed(&processed, &usable_refs) {
+                                    continue; // Skip this clause, it's subsumed
+                                }
+                            }
+
                             // Add to sos (with max_weight filtering)
                             self.try_keep_clause(processed);
                         }
@@ -801,6 +917,14 @@ impl Prover {
                                     clauses_generated: self.clauses_generated,
                                     clauses_kept: self.clauses_kept,
                                 };
+                            }
+
+                            // Forward subsumption: check if new clause is subsumed by existing clauses
+                            if self.config.use_subsumption {
+                                let usable_refs: Vec<&Clause> = usable_clauses.iter().collect();
+                                if forward_subsumed(&processed, &usable_refs) {
+                                    continue; // Skip this clause, it's subsumed
+                                }
                             }
 
                             // Add to sos (with max_weight filtering)
@@ -962,6 +1086,7 @@ mod tests {
             use_demod: false,
             use_factor: false,
             use_ur_res: false,
+            ..Default::default()
         });
 
         // Add multiple clauses to sos so we hit the given limit
